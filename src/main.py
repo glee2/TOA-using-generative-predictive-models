@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.1
-Description (primary changes): SEQ2SEQ Model training
+Version: 0.2
+Description (primary changes): Add attention decoder
 '''
 
 # Set root directory
@@ -38,15 +38,13 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Decoder_SEQ, SEQ2SEQ
+from model import Encoder_SEQ, Decoder_SEQ, AttnDecoder_SEQ, SEQ2SEQ
 from train_utils import run_epoch, EarlyStopping, perf_eval
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_type', default='sequence')
-# parser.add_argument('--target', default=None)
 parser.add_argument('--train', default=False, action='store_true')
 parser.add_argument('--n_folds', default=1, type=int)
-# parser.add_argument('--n_resampled', default=500, type=int)
 parser.add_argument('--learning_rate', default=5e-3, type=float)
 parser.add_argument('--batch_size', default=128, type=int)
 parser.add_argument('--max_epochs', default=2, type=int)
@@ -56,10 +54,6 @@ parser.add_argument('--hidden_dim', default=32, type=int)
 parser.add_argument('--n_layers', default=1, type=int)
 parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
 parser.add_argument('--target_ipc', default='A61C', type=str)
-# parser.add_argument('--no_class_weight', dest='no_class_weight', action='store_true')
-# parser.add_argument('--no_oversampling', dest='no_oversampling', action='store_true')
-# parser.add_argument('--use_multi_channel', dest='use_multi_channel', action='store_true')
-# parser.add_argument('--overlap', default=False, action='store_true')
 
 if __name__=="__main__":
     args = parser.parse_args()
@@ -87,24 +81,6 @@ if __name__=="__main__":
     target_ipc = args.target_ipc
     use_early_stopping = False if args.no_early_stopping else True
     if use_early_stopping: early_stop_patience = int(0.3*max_epochs)
-    # # use_class_weight = False if args.no_class_weight else True
-    # # use_oversampling = False if args.no_oversampling else True
-    # # if use_oversampling:
-    # #     n_resampled = args.n_resampled
-    # # else:
-    # #     n_resampled = None
-    # bool_param_name = "_".join(np.array(["ES","CW","OS"])[[use_early_stopping, use_class_weight, use_oversampling]])
-    #
-    # use_multi_channel = args.use_multi_channel
-    # if use_multi_channel:
-    #     n_channels = 3
-    # else:
-    #     n_channels = 1
-    #
-    # overlap = args.overlap
-    # param_overlap = "(overlapped)" if overlap else ""
-    #
-    # prpd_shape = (args.n_rows, args.n_cols)
 
     train_param_name = f"TRAIN_{args.data_type}{n_folds}folds_{learning_rate}lr_{batch_size}batch_{max_epochs}ep"
     best_model_path = os.path.join(root_dir, "models", "[CV_best_model]"+train_param_name+".ckpt")
@@ -143,7 +119,8 @@ if __name__=="__main__":
             val_loader_cv = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, num_workers=8)
 
             enc = Encoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers).to(device=device, dtype=torch.float)
-            dec = Decoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers).to(device=device, dtype=torch.float)
+            # dec = Decoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers).to(device=device, dtype=torch.float)
+            dec = AttnDecoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
             model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
             model = torch.nn.DataParallel(model, device_ids=device_ids)
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)

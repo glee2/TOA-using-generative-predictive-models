@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.1
-Description (primary changes): Sequence data
+Version: 0.2
+Description (primary changes): Nothing
 '''
 
 # Set root directory
@@ -107,23 +107,6 @@ class TechDataset(Dataset):
         else:
             X, Y = self.X[idx], self.Y[idx]
         return X, Y
-
-    # def get_resampled_idx(self, n_resampled=None):
-    #     if n_resampled is None:
-    #         return self.metadata.index
-    #     resampled_idx = []
-    #     for label in np.unique(self.metadata['target']):
-    #         label_index_org = self.metadata.loc[self.original_idx]['target'][self.metadata.loc[self.original_idx]['target']==label].index
-    #         if n_resampled < len(label_index_org):
-    #             resampled_idx.append(np.random.choice(label_index_org, n_resampled, replace=False))
-    #         else:
-    #             resampled_idx.append(label_index_org)
-    #             label_index_oversampled = self.metadata.loc[self.oversampled_idx]['target'][self.metadata.loc[self.oversampled_idx]['target']==label].index
-    #             if n_resampled > len(label_index_org)+len(label_index_oversampled):
-    #                 print(f"Requested n_resampled is larger than the number of prepared data, so set it as maximum number {len(label_index_org)+len(label_index_oversampled)}")
-    #                 n_resampled = len(label_index_org)+len(label_index_oversampled)
-    #             resampled_idx.append(np.random.choice(label_index_oversampled, n_resampled-len(label_index_org), replace=False))
-    #     return pd.Index(np.sort(np.concatenate(resampled_idx)))
 
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):

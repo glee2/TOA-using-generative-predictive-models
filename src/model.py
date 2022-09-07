@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.1
-Description (primary changes): Pytorch native model class
+Version: 0.2
+Description (primary changes): Add attention decoder
 '''
 
 # Set root directory
@@ -46,7 +46,7 @@ class Encoder_SEQ(nn.Module):
         hidden = self.initHidden(len(inputs)).to(self.device)
         output, hidden = self.gru(embedded, hidden)
 
-        return hidden
+        return output, hidden
 
     def initHidden(self, batch_size):
         return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
@@ -84,6 +84,32 @@ class Decoder_SEQ(nn.Module):
     def initHidden(self, batch_size):
         return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
+class AttnDecoder_SEQ(Decoder_SEQ):
+    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, max_len=99, dropout=0.1):
+        super(AttnDecoder_SEQ, self).__init__(embedding_dim, vocab_size, hidden_dim, n_layers, device)
+        self.max_len = max_len
+        self.gru = nn.GRU(hidden_dim, hidden_dim, n_layers, batch_first=True).to(device)
+        self.attn = nn.Linear(self.hidden_dim * 2, self.max_len)
+        self.attn_combine = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+
+    def forward(self, inputs, hidden, encoder_outputs):
+        if hidden is None:
+            hidden = self.initHidden(len(inputs))
+        embedded = self.dropout(self.embedding(inputs))
+
+        attn_weights = F.softmax(self.attn(torch.cat((embedded[:,0], hidden[0]), 1)), dim=1)
+        attn_applied = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
+        output = torch.cat((embedded[:,0], attn_applied[:,0]), 1)
+        output = F.relu(self.attn_combine(output).unsqueeze(1))
+
+        output, hidden = self.gru(output, hidden)
+        pred = self.linear(output.squeeze(1))
+        pred = self.softmax(pred)
+
+        return pred, hidden, attn_weights
+
+    def initHidden(self, batch_size):
+        return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
 class SEQ2SEQ(nn.Module):
     def __init__(self, device='cpu', dataset=None, enc=None, dec=None, pred=None, max_len=99, u=0.5):
@@ -104,18 +130,19 @@ class SEQ2SEQ(nn.Module):
         batch_size = x.size(0)
         vocab_size = self.decoder.vocab_size
 
-        # outputs = torch.zeros(self.max_len, batch_size, vocab_size).to(device=self.device)
-        # outputs[0,:,0] = 1.
-
         outputs = torch.zeros(batch_size, vocab_size, self.max_len).to(device=self.device)
         outputs[:,0,0] = 1.
 
-        z = self.encoder(x)
+        # encoder_outputs = torch.zeros(self.max_len, self.encoder.hidden_dim, device=self.device)
+        encoder_output, z = self.encoder(x)
+        #
+        # for ei in range(self.max_len):
+        #     enco
 
         next_hidden = z
         next_input = torch.from_numpy(np.tile([self.dataset.vocab_w2i[TOKEN_SOS]], batch_size)).unsqueeze(1).to(device=self.device)
         for t in range(1, self.max_len):
-            output, next_hidden, pred_token = self.pred_next(next_input, next_hidden)
+            output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, encoder_output)
 
             rand_num = np.random.random()
             if rand_num < teach_force_ratio:
@@ -126,8 +153,8 @@ class SEQ2SEQ(nn.Module):
 
         return outputs, z
 
-    def pred_next(self, _next_input, _next_hidden):
-        _output, _hidden = self.decoder(_next_input, _next_hidden)
+    def pred_next(self, _next_input, _next_hidden, _encoder_outputs):
+        _output, _hidden, _attn_weights = self.decoder(_next_input, _next_hidden, _encoder_outputs)
         _pred_token = _output.argmax(1)
         if _output.size(0) != 1: _pred_token = _pred_token.squeeze(0)
 
