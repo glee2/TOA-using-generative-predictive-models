@@ -29,27 +29,40 @@ TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
 class Encoder_SEQ(nn.Module):
-    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, dropout=0.1, padding_idx=None):
+    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, bidirec=False, dropout=0.1, padding_idx=None):
         super(Encoder_SEQ, self).__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
+        hidden_dim_enc = hidden_dim * 2 if bidirec else hidden_dim
+        self.hidden_dim_enc = hidden_dim_enc
         self.n_layers = n_layers
         self.device = device
         self.vocab_size = vocab_size
+        self.bidirec = bidirec
+        self.n_directions = 2 if self.bidirec else 1
 
-        self.gru = nn.GRU(embedding_dim, hidden_dim, n_layers, batch_first=True).to(device)
+        self.gru = nn.GRU(embedding_dim, hidden_dim, n_layers, batch_first=True, bidirectional=bidirec).to(device)
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=padding_idx).to(device)
         self.dropout = nn.Dropout(dropout).to(device)
+        self.fc = nn.Linear(hidden_dim_enc, hidden_dim)
 
     def forward(self, inputs):
-        embedded = self.dropout(self.embedding(inputs))
-        hidden = self.initHidden(len(inputs)).to(self.device)
+        # inputs: (batch_size, seq_len)
+
+        embedded = self.dropout(self.embedding(inputs)) # (batch_size, seq_len, embedding_dim)
+        hidden = self.initHidden(len(inputs)).to(self.device) # (n_layers, batch_size, hidden_dim)
         output, hidden = self.gru(embedded, hidden)
+        # output: (batch_size, seq_len, hidden_dim_enc), hidden: (batch_size, hidden_dim)
+
+        if self.bidirec:
+            hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1))) # (batch_size, hidden_dim)
+        else:
+            hidden = hidden[-1,:,:] # hidden weights from the last layer
 
         return output, hidden
 
     def initHidden(self, batch_size):
-        return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
+        return torch.zeros(self.n_layers * self.n_directions, batch_size, self.hidden_dim).to(self.device)
 
 class Decoder_SEQ(nn.Module):
     def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, dropout=0.1):
@@ -57,7 +70,6 @@ class Decoder_SEQ(nn.Module):
 
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
-        # self.output_dim = output_dim
         self.n_layers = n_layers
         self.device = device
         self.vocab_size = vocab_size
@@ -71,10 +83,7 @@ class Decoder_SEQ(nn.Module):
     def forward(self, inputs, hidden=None):
         if hidden == None:
             hidden = self.initHidden(len(inputs))
-        # inputs = inputs.unsqueeze(0)
-        # n_batch = inputs.shape[1]
         embedded = self.dropout(self.embedding(inputs))
-        # embedded = F.relu(embedded)
         output, hidden = self.gru(embedded, hidden)
         pred = self.linear(output.squeeze(1))
         pred = self.softmax(pred)
@@ -84,32 +93,69 @@ class Decoder_SEQ(nn.Module):
     def initHidden(self, batch_size):
         return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
-class AttnDecoder_SEQ(Decoder_SEQ):
-    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, max_len=99, dropout=0.1):
-        super(AttnDecoder_SEQ, self).__init__(embedding_dim, vocab_size, hidden_dim, n_layers, device)
+class Attention(nn.Module):
+    def __init__(self, hidden_dim_enc, hidden_dim_dec):
+        super().__init__()
+
+        self.attn = nn.Linear(hidden_dim_enc + hidden_dim_dec, hidden_dim_dec)
+        self.v = nn.Linear(hidden_dim_dec, 1, bias=False)
+
+    def forward(self, hidden, encoder_outputs):
+        # hidden: (batch_size, hidden_dim_dec), encoder_outputs: (batch_size, seq_len, hidden_dim_enc)
+
+        batch_size = encoder_outputs.shape[0]
+        seq_len = encoder_outputs.shape[1]
+
+        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)
+        # hidden = hidden.repeat(1, seq_len, 1)
+
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2))) # (batch_size, seq_len, hidden_dim_dec)
+        attention = self.v(energy).squeeze(2) # (batch_size, seq_len)
+
+        return F.softmax(attention, dim=1)
+
+class AttnDecoder_SEQ(nn.Module):
+    def __init__(self, embedding_dim, vocab_size, hidden_dim_dec, hidden_dim_enc, attention, n_layers, device, max_len=99, dropout=0.1):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.vocab_size = vocab_size
+        self.hidden_dim_dec = hidden_dim_dec
+        self.hidden_dim_enc = hidden_dim_enc
+        self.n_layers = n_layers
+        self.device = device
         self.max_len = max_len
-        self.gru = nn.GRU(hidden_dim, hidden_dim, n_layers, batch_first=True).to(device)
-        self.attn = nn.Linear(self.hidden_dim * 2, self.max_len)
-        self.attn_combine = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
+
+        self.attention = attention
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        self.gru = nn.GRU(hidden_dim_enc + embedding_dim, hidden_dim_dec, n_layers, batch_first=True).to(device)
+        self.fc_out = nn.Linear(hidden_dim_enc + hidden_dim_dec + embedding_dim, vocab_size)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, inputs, hidden, encoder_outputs):
-        if hidden is None:
-            hidden = self.initHidden(len(inputs))
-        embedded = self.dropout(self.embedding(inputs))
+        # inputs: (batch_size), hidden: (batch_size, hidden_dim_dec), encoder_outputs: (batch_size, seq_len, hidden_dim_enc)
+        inputs = inputs.unsqueeze(1) # (1, batch_size)
 
-        attn_weights = F.softmax(self.attn(torch.cat((embedded[:,0], hidden[0]), 1)), dim=1)
-        attn_applied = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs)
-        output = torch.cat((embedded[:,0], attn_applied[:,0]), 1)
-        output = F.relu(self.attn_combine(output).unsqueeze(1))
+        embedded = self.dropout(self.embedding(inputs)) # (batch_size, 1, embedding_dim)
 
-        output, hidden = self.gru(output, hidden)
-        pred = self.linear(output.squeeze(1))
-        pred = self.softmax(pred)
+        a = self.attention(hidden, encoder_outputs)
+        a = a.unsqueeze(1) # (batch_size, 1, seq_len)
 
-        return pred, hidden, attn_weights
+        weighted = torch.bmm(a, encoder_outputs) # (batch_size, 1, hidden_dim_enc)
 
-    def initHidden(self, batch_size):
-        return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
+        gru_input = torch.cat((embedded, weighted), dim=2) # (batch_size, 1, hidden_dim_enc + embedding_dim)
+
+        output, hidden = self.gru(gru_input, hidden.unsqueeze(0)) # output: (batch_size, 1, hidden_dim_dec), hidden: (n_layers, batch_size, hidden_dim_dec)
+
+        embedded = embedded.squeeze(1)
+        output = output.squeeze(1)
+        weighted = weighted.squeeze(1)
+
+        prediction = self.fc_out(torch.cat((output, weighted, embedded), dim=1)) # (batch_size, vocab_size)
+
+        return prediction, hidden.squeeze(0)
+    #
+    # def initHidden(self, batch_size):
+    #     return torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device)
 
 class SEQ2SEQ(nn.Module):
     def __init__(self, device='cpu', dataset=None, enc=None, dec=None, pred=None, max_len=99, u=0.5):
@@ -121,51 +167,54 @@ class SEQ2SEQ(nn.Module):
         self.predictor = pred
         self.max_len = max_len
         self.u = u
-        assert self.encoder.hidden_dim == self.decoder.hidden_dim, \
-        "Hidden dimensions of encoder and decoder must be equal!"
-        assert self.encoder.n_layers == self.decoder.n_layers, \
-        "Encoder and decoder must have equal number of layers!"
+        # assert self.encoder.hidden_dim == self.decoder.hidden_dim, \
+        # "Hidden dimensions of encoder and decoder must be equal!"
+        # assert self.encoder.n_layers == self.decoder.n_layers, \
+        # "Encoder and decoder must have equal number of layers!"
 
     def forward(self, x, teach_force_ratio=0.75):
+        # x: (batch_size, seq_len)
         batch_size = x.size(0)
         vocab_size = self.decoder.vocab_size
 
-        outputs = torch.zeros(batch_size, vocab_size, self.max_len).to(device=self.device)
-        outputs[:,0,0] = 1.
+        outputs = torch.zeros(batch_size, vocab_size, self.max_len).to(device=self.device) # (batch_size, vocab_size, seq_len)
+        outputs[:,self.dataset.vocab_w2i[TOKEN_SOS],0] = 1.
 
         # encoder_outputs = torch.zeros(self.max_len, self.encoder.hidden_dim, device=self.device)
         encoder_output, z = self.encoder(x)
-        #
-        # for ei in range(self.max_len):
-        #     enco
+        # encoder_output: (batch_size, seq_len, hidden_dim_enc), z:
 
         next_hidden = z
-        next_input = torch.from_numpy(np.tile([self.dataset.vocab_w2i[TOKEN_SOS]], batch_size)).unsqueeze(1).to(device=self.device)
+        next_input = torch.from_numpy(np.tile([self.dataset.vocab_w2i[TOKEN_SOS]], batch_size)).to(device=self.device) # (batch_size)
         for t in range(1, self.max_len):
             output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, encoder_output)
+            # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim_dec), pred_token: (batch_size)
 
             rand_num = np.random.random()
             if rand_num < teach_force_ratio:
-                next_input = x[:,t].unsqueeze(1)
+                # next_input = x[:,t].unsqueeze(1)
+                next_input = x[:,t] # (batch_size)
             else:
-                next_input = pred_token.unsqueeze(1)
+                # next_input = pred_token.unsqueeze(1)
+                next_input = pred_token # (batch_size)
             outputs[:,:,t] = output
 
         return outputs, z
 
-    def pred_next(self, _next_input, _next_hidden, _encoder_outputs):
-        _output, _hidden, _attn_weights = self.decoder(_next_input, _next_hidden, _encoder_outputs)
-        _pred_token = _output.argmax(1)
-        if _output.size(0) != 1: _pred_token = _pred_token.squeeze(0)
+    def pred_next(self, next_input, next_hidden, encoder_outputs):
+        output, hidden = self.decoder(next_input, next_hidden, encoder_outputs)
+        # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim_dec)
 
-        if _pred_token.size() == torch.Size([]):
-            print(_output.shape, _hidden.shape, _pred_token.shape, _next_input.shape)
+        pred_token = output.argmax(1) # (batch_size)
+        if output.size(0) != 1: pred_token = pred_token.squeeze(0)
 
-        if self.dataset.vocab_w2i[TOKEN_EOS] in _next_input.view(-1):
-            # print("ERROR",_next_input==self.dataset.vocab_w2i[TOKEN_EOS])
-            _pred_token[_next_input.view(-1)==self.dataset.vocab_w2i[TOKEN_EOS]] = self.dataset.vocab_w2i[TOKEN_PAD]
+        if pred_token.size() == torch.Size([]):
+            print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
 
-        return _output, _hidden, _pred_token
+        if self.dataset.vocab_w2i[TOKEN_EOS] in next_input.view(-1):
+            pred_token[next_input.view(-1)==self.dataset.vocab_w2i[TOKEN_EOS]] = self.dataset.vocab_w2i[TOKEN_PAD]
+
+        return output, hidden, pred_token
 
 class SEQ2SEQ_pred(nn.Module):
     def __init__(self, enc_c, pred, enc_t, device):

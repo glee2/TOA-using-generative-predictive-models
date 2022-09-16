@@ -2,11 +2,11 @@
 '''
 Author: Gyumin Lee
 Version: 0.2
-Description (primary changes): Nothing
+Description (primary changes): Dataset
 '''
 
 # Set root directory
-root_dir = '[ROOT_DIR]'
+root_dir = '/home2/glee/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 

@@ -6,7 +6,7 @@ Description (primary changes): Add attention
 '''
 
 # Set root directory
-root_dir = '/home2/glee/railway/data/'
+root_dir = '/home2/glee/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
@@ -84,8 +84,8 @@ def run_epoch(dataloader, model, loss_fn, mode='train', optimizer=None, device='
     if mode == 'train':
         model.train()
         for batch, (X, Y) in enumerate(dataloader):
-            X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long)
-            outputs, z = model(X) # outputs shape: (batch_size, vocab_size, seq_len)
+            X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
+            outputs, z = model(X) # outputs: (batch_size, vocab_size, seq_len)
             preds = outputs
             trues = X.clone()
             loss = loss_fn(preds, trues)

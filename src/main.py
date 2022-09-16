@@ -23,6 +23,7 @@ sys.path.append("/share/tml_package")
 from tml import utils
 from scipy import io
 from tqdm import tqdm
+from collections import OrderedDict
 
 import torch
 from torch.nn import functional as F
@@ -38,8 +39,13 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Decoder_SEQ, AttnDecoder_SEQ, SEQ2SEQ
+from model import Encoder_SEQ, Decoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ
 from train_utils import run_epoch, EarlyStopping, perf_eval
+from utils import token2class
+
+TOKEN_SOS = '<SOS>'
+TOKEN_EOS = '<EOS>'
+TOKEN_PAD = '<PAD>'
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data_type', default='sequence')
@@ -54,6 +60,7 @@ parser.add_argument('--hidden_dim', default=32, type=int)
 parser.add_argument('--n_layers', default=1, type=int)
 parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
 parser.add_argument('--target_ipc', default='A61C', type=str)
+parser.add_argument('--bidirec', default=False, action='store_true')
 
 if __name__=="__main__":
     args = parser.parse_args()
@@ -77,30 +84,39 @@ if __name__=="__main__":
     embedding_dim = args.embedding_dim
     hidden_dim = args.hidden_dim
     n_layers = args.n_layers
+    bidirec = args.bidirec
+
+    if bidirec:
+        hidden_dim_enc = hidden_dim * 2
+    else:
+        hidden_dim_enc = hidden_dim
 
     target_ipc = args.target_ipc
     use_early_stopping = False if args.no_early_stopping else True
     if use_early_stopping: early_stop_patience = int(0.3*max_epochs)
 
     train_param_name = f"TRAIN_{args.data_type}{n_folds}folds_{learning_rate}lr_{batch_size}batch_{max_epochs}ep"
-    best_model_path = os.path.join(root_dir, "models", "[CV_best_model]"+train_param_name+".ckpt")
+    best_model_path = os.path.join(root_dir, "models", f"[CV_best_model][{target_ipc}]{train_param_name}.ckpt")
 
     train_params = {'target_ipc': target_ipc}
 
-    if args.train:
-        # Sampling for cross validation
-        print("Load dataset...")
-        tstart = time.time()
-        tech_dataset = TechDataset(device=device, data_dir=data_dir, do_transform=False, params=train_params)
-        data_loader = DataLoader(tech_dataset, batch_size=batch_size)
-        tend = time.time()
-        print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
+    # Sampling for cross validation
+    print("Load dataset...")
+    tstart = time.time()
+    tech_dataset = TechDataset(device=device, data_dir=data_dir, do_transform=False, params=train_params)
+    data_loader = DataLoader(tech_dataset, batch_size=batch_size)
+    tend = time.time()
+    print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
 
+    if args.train:
         sampler = CVSampler(tech_dataset, n_folds=n_folds, test_ratio=0.3)
         cv_idx = sampler.get_idx_dict()
         print(f"#Samples\nTrain: {len(cv_idx[0]['train'])}, Validation: {len(cv_idx[0]['val'])}, Test: {len(cv_idx[0]['test'])}")
 
-        loss_fn = torch.nn.CrossEntropyLoss()
+        # Ignoring padding index
+        padding_idx = tech_dataset.vocab_w2i[TOKEN_PAD]
+        # loss_fn = torch.nn.CrossEntropyLoss()
+        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=padding_idx)
 
         # Leave test set
         test_dataset = Subset(tech_dataset, cv_idx[0]['test'])
@@ -118,9 +134,12 @@ if __name__=="__main__":
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
             val_loader_cv = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, num_workers=8)
 
-            enc = Encoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers).to(device=device, dtype=torch.float)
-            # dec = Decoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers).to(device=device, dtype=torch.float)
-            dec = AttnDecoder_SEQ(device=device, embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
+
+            attention_module = Attention(hidden_dim_enc, hidden_dim)
+
+            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim_dec=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=attention_module, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+
             model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
             model = torch.nn.DataParallel(model, device_ids=device_ids)
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -152,21 +171,54 @@ if __name__=="__main__":
 
         trues_cv = np.concatenate(trues_cv)
         preds_cv = np.concatenate(preds_cv)
-        # eval_cv, conf_cv = perf_eval('CNN_cv', trues_cv, preds_cv)
-        # conf_cv = conf_cv.astype(np.int32)
 
         best_model = trained_models[np.argmax(list(losses_per_fold.values()))].module # best model in CV # unwrap data parallel
         trues_test = Y_test.cpu().detach().numpy()
         outputs_test, z_test = best_model(X_test)
         preds_test = outputs_test.cpu().detach().numpy()
-        # eval_test, conf_test = perf_eval('CNN_test', trues_test, preds_test)
-        # eval_res = pd.concat([eval_cv, eval_test], axis=0)
-        # eval_res.to_csv("../results/[Eval_res]"+train_param_name+".csv")
-        # np.savetxt("../results/[Confmat_CV]"+train_param_name+".txt", conf_cv, delimiter=',', fmt="%d")
-        # np.savetxt("../results/[Confmat_TEST]"+train_param_name+".txt", conf_test, delimiter=',', fmt="%d")
         torch.save(best_model.state_dict(), best_model_path)
 
+        # Qaultitative evaluation
+        X_test_class = pd.Series(token2class(X_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
+
+        preds_test, h_test = best_model(X_test.to(device))
+        preds_test = preds_test.argmax(1)
+        preds_test_class = pd.Series(token2class(preds_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
+
+        test_res = pd.concat([X_test_class, preds_test_class], axis=1)
+        test_res.columns = ['TRUE', 'PRED']
+        print(test_res)
+
     else:
+        enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
+
+        attention_module = Attention(hidden_dim, hidden_dim)
+
+        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim_dec=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=attention_module, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+
         best_model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
         best_model = torch.nn.DataParallel(best_model, device_ids=device_ids)
-        best_model = best_model.load_state_dict(torch.load(best_model_path))
+
+        best_states = torch.load(best_model_path)
+        converted_states = OrderedDict()
+        for k, v in best_states.items():
+            if 'module' not in k:
+                k = 'module.'+k
+            else:
+                k = k.replace('features.module.', 'module.features.')
+            converted_states[k] = v
+
+        best_model.load_state_dict(converted_states)
+
+        for batch, (X, Y) in enumerate(data_loader):
+            X_class = pd.Series(token2class(X.tolist(), vocabulary=tech_dataset.vocab_i2w))
+
+            preds, h = best_model(X.to(device))
+            preds = preds.argmax(1)
+            preds_class = pd.Series(token2class(preds.tolist(), vocabulary=tech_dataset.vocab_i2w))
+
+            test_res = pd.concat([X_class, preds_class], axis=1)
+            test_res.columns = ['TRUE', 'PRED']
+            print(test_res)
+
+            if batch == 10: break
