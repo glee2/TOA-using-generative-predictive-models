@@ -85,9 +85,10 @@ if __name__=="__main__":
     hidden_dim = args.hidden_dim
     n_layers = args.n_layers
     bidirec = args.bidirec
+    n_directions = 2 if bidirec else 1
 
     if bidirec:
-        hidden_dim_enc = hidden_dim * 2
+        hidden_dim_enc = hidden_dim * n_directions
     else:
         hidden_dim_enc = hidden_dim
 
@@ -136,9 +137,9 @@ if __name__=="__main__":
 
             enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
 
-            attention_module = Attention(hidden_dim_enc, hidden_dim)
+            att = Attention(hidden_dim_enc, hidden_dim)
 
-            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim_dec=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=attention_module, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
 
             model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
             model = torch.nn.DataParallel(model, device_ids=device_ids)
@@ -190,11 +191,11 @@ if __name__=="__main__":
         print(test_res)
 
     else:
-        enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
+        enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec, device=device).to(device=device, dtype=torch.float)
 
-        attention_module = Attention(hidden_dim, hidden_dim)
+        att = Attention(hidden_dim_enc, hidden_dim)
 
-        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim_dec=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=attention_module, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
 
         best_model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
         best_model = torch.nn.DataParallel(best_model, device_ids=device_ids)
@@ -222,3 +223,45 @@ if __name__=="__main__":
             print(test_res)
 
             if batch == 10: break
+
+    ## TEST: new sample generation from latent vector only
+    xs, ys = next(iter(data_loader))
+    x = xs[0].unsqueeze(0).to(device)
+    print(f"Generation test\nExample: {token2class(x.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
+    o_enc, h_enc = enc(x)
+    # h_enc = h_enc.view(n_layers, n_directions, batch_size, hidden_dim)
+
+    # Take the last layer hidden vector as latent vector
+    # z = z[-1].view(1, batch_size, -1) # last layer hidden_vector -> (1, batch_size, hidden_dim * n_directions)
+    z = h_enc
+    new_outputs = torch.zeros(1, tech_dataset.vocab_size, tech_dataset.seq_len)
+    next_input = torch.from_numpy(np.tile([tech_dataset.vocab_w2i[TOKEN_SOS]], 1)).to(device)
+    for t in range(1, tech_dataset.seq_len):
+        embedded = dec.dropout(dec.embedding(next_input.unsqueeze(1)))
+        gru_input = torch.cat((embedded, z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
+        o_dec, h_dec = dec.gru(gru_input, z)
+        output = dec.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
+        prediction = output.argmax(1)
+
+        next_input = prediction
+        new_outputs[:,:,t] = output
+    new_outputs = new_outputs.argmax(1)
+
+    print(f"Generated output (using the original latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
+
+    # What if adding noise to latent vector?
+    new_z = z + z.mean().item() * 1e-2
+    new_outputs = torch.zeros(1, tech_dataset.vocab_size, tech_dataset.seq_len)
+    next_input = torch.from_numpy(np.tile([tech_dataset.vocab_w2i[TOKEN_SOS]], 1)).to(device)
+    for t in range(1, tech_dataset.seq_len):
+        embedded = dec.dropout(dec.embedding(next_input.unsqueeze(1)))
+        gru_input = torch.cat((embedded, new_z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
+        o_dec, h_dec = dec.gru(gru_input, h_enc)
+        output = dec.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
+        prediction = output.argmax(1)
+
+        next_input = prediction
+        new_outputs[:,:,t] = output
+    new_outputs = new_outputs.argmax(1)
+
+    print(f"Generated output (using changed latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
