@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.2
-Description (primary changes): Dataset
+Version: 0.3
+Description (primary changes): Add ipc_level
 '''
 
 # Set root directory
@@ -31,7 +31,7 @@ TOKEN_SOS = '<SOS>'
 TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
-regex = re.compile("[0-9a-zA-Z]+")
+regex = re.compile("[0-9a-zA-Z\/]+")
 
 class TechDataset(Dataset):
     def __init__(self, device=None, data_dir="", params=None, do_transform=False):
@@ -40,15 +40,15 @@ class TechDataset(Dataset):
         self.device = device
         self.data_dir = data_dir
         if params is not None:
-            self.params = {'target_ipc': 'A61C', 'n_TC': 3}
+            self.params = {'target_ipc': 'A61C', 'n_TC': 3, 'ipc_level': 3}
             self.params.update(params)
         else:
-            self.params = {'target_ipc': 'A61C', 'n_TC': 3}
+            self.params = {'target_ipc': 'A61C', 'n_TC': 3, 'ipc_level': 3}
         self.do_transform = do_transform
 
         self.rawdata = pd.read_csv(os.path.join(data_dir, "collection_final.csv"))
 
-        self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess(target_ipc=self.params['target_ipc'], n_TC=self.params['n_TC'])
+        self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess(target_ipc=self.params['target_ipc'], ipc_level=self.params['ipc_level'], n_TC=self.params['n_TC'])
         self.X, self.Y = self.make_io()
 
     def make_io(self, val_main=10, val_sub=1):
@@ -69,7 +69,7 @@ class TechDataset(Dataset):
         Y = sample['TC'+str(self.params['n_TC'])]
         return X, Y
 
-    def preprocess(self, target_ipc='A61C', n_TC=3):
+    def preprocess(self, target_ipc='A61C', ipc_level=3, n_TC=3):
         cols_year = ['<1976']+list(np.arange(1976,2018).astype(str))
 
         rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc', 'sub ipc'])[['number','main ipc','sub ipc']]
@@ -80,13 +80,22 @@ class TechDataset(Dataset):
         data = rawdata_ipc[['number']].copy(deep=True)
         # data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: x.replace(' ',''))
         # data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: x.replace(' ','').split(';'))
-        data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0])
-        data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0] for xx in x.split(';')])
+        assert ipc_level in [1,2,3], f"Not implemented for an IPC level {ipc_level}"
+        if ipc_level == 1:
+            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0][:3])
+            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0][:3] for xx in x.split(';')])
+        elif ipc_level == 2:
+            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0])
+            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0] for xx in x.split(';')])
+        elif ipc_level == 3:
+            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: "".join(regex.findall(x)))
+            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: ["".join(regex.findall(xx)) for xx in x.split(';')])
         data['TC'+str(n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year']+1 if x['year']<2017 else 2017, x['year']+n_TC+1 if x['year']+n_TC<2018 else 2018).astype(str)].sum(), axis=1)
         data = data.set_index('number')
         seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
 
-        main_ipcs = [x.replace(' ','') for x in main_ipcs]
+        # main_ipcs = [target_ipc]
+        main_ipcs = list(np.unique(data['main_ipc']))
         sub_ipcs = list(np.unique(np.concatenate(list(data['sub_ipc'].values))))
         all_ipcs = list(np.union1d(main_ipcs, sub_ipcs))
 

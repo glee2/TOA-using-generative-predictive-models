@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.2
-Description (primary changes): Add attention
+Version: 0.3
+Description (primary changes): Add loss_weights
 '''
 
 # Set root directory
@@ -75,24 +75,28 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         self.val_loss_min = val_loss
 
-def run_epoch(dataloader, model, loss_fn, mode='train', optimizer=None, device='cpu'):
+def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=None, loss_weights={'recon': 5, 'y': 5}, device='cpu'):
     size = len(dataloader.dataset)
     n_batches = len(dataloader)
     test_loss, correct = 0, 0
+    loss_weights['recon'] = loss_weights['recon'] / sum(loss_weights.values())
+    loss_weights['y'] = 1 - loss_weights['recon']
 
     batch_losses = []
     if mode == 'train':
         model.train()
         for batch, (X, Y) in enumerate(dataloader):
-            X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
-            outputs, z = model(X) # outputs: (batch_size, vocab_size, seq_len)
-            preds = outputs
-            trues = X.clone()
-            loss = loss_fn(preds, trues)
+            X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.float) # X: (batch_size, seq_len)
+            preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
+            trues_recon = X.clone()
+            trues_y = Y.clone()
+            # print(f"Recon loss: {loss_recon(preds_recon, trues_recon)}, Y loss: {loss_y(preds_y, trues_y)}")
+            # loss = loss_recon(preds_recon, trues_recon) + loss_y(preds_y, trues_y)*10
+            loss = sum([loss_weights['recon']*loss_recon(preds_recon, trues_recon), loss_weights['y']*loss_y(preds_y, trues_y)])
             batch_losses.append(loss.item())
 
             optimizer.zero_grad()
-            loss.backward()
+            loss.sum().backward()
             optimizer.step()
 
             if batch % 10 == 0 or batch == len(dataloader)-1:
@@ -104,15 +108,17 @@ def run_epoch(dataloader, model, loss_fn, mode='train', optimizer=None, device='
         model.eval()
         with torch.no_grad():
             for X, Y in dataloader:
-                X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long)
-                outputs, z = model(X) # outputs shape: (batch_size, vocab_size, seq_len)
-                preds = outputs
-                trues = X.clone()
-                loss = loss_fn(preds, trues)
+                X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
+                preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
+                trues_recon = X.clone()
+                trues_y = Y.clone()
+                # loss = loss_recon(preds_recon, trues_recon) + loss_y(preds_y, trues_y)*10
+                # loss = sum([loss_recon(preds_recon, trues_recon), loss_y(preds_y, trues_y)*5])
+                loss = sum([loss_weights['recon']*loss_recon(preds_recon, trues_recon), loss_weights['y']*loss_y(preds_y, trues_y)])
                 test_loss += loss.item()
                 batch_losses.append(loss.item())
         test_loss /= n_batches
-        print(f"Avg loss: {test_loss:>8f}\n")
+        # print(f"Avg loss: {test_loss:>8f}\n")
 
     return np.average(batch_losses)
 

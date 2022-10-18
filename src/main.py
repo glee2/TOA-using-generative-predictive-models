@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.2
-Description (primary changes): Add attention decoder
+Version: 0.3
+Description (primary changes): Add ipc_level, Add loss_weights
 '''
 
 # Set root directory
@@ -39,7 +39,7 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Decoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ
+from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
 from train_utils import run_epoch, EarlyStopping, perf_eval
 from utils import token2class
 
@@ -60,6 +60,7 @@ parser.add_argument('--hidden_dim', default=32, type=int)
 parser.add_argument('--n_layers', default=1, type=int)
 parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
 parser.add_argument('--target_ipc', default='A61C', type=str)
+parser.add_argument('--ipc_level', default=3, type=int, help="IPC level. 1: Section-Class, 2: Section-Class-Sub Class, 3: Section-Class-Sub Class-Group(main or sub)")
 parser.add_argument('--bidirec', default=False, action='store_true')
 
 if __name__=="__main__":
@@ -87,19 +88,17 @@ if __name__=="__main__":
     bidirec = args.bidirec
     n_directions = 2 if bidirec else 1
 
-    if bidirec:
-        hidden_dim_enc = hidden_dim * n_directions
-    else:
-        hidden_dim_enc = hidden_dim
-
     target_ipc = args.target_ipc
+    ipc_level = args.ipc_level
+    loss_weights = {'recon': 3, 'y': 7}
+
     use_early_stopping = False if args.no_early_stopping else True
     if use_early_stopping: early_stop_patience = int(0.3*max_epochs)
 
     train_param_name = f"TRAIN_{args.data_type}{n_folds}folds_{learning_rate}lr_{batch_size}batch_{max_epochs}ep"
     best_model_path = os.path.join(root_dir, "models", f"[CV_best_model][{target_ipc}]{train_param_name}.ckpt")
 
-    train_params = {'target_ipc': target_ipc}
+    train_params = {'target_ipc': target_ipc, 'ipc_level': ipc_level}
 
     # Sampling for cross validation
     print("Load dataset...")
@@ -117,15 +116,16 @@ if __name__=="__main__":
         # Ignoring padding index
         padding_idx = tech_dataset.vocab_w2i[TOKEN_PAD]
         # loss_fn = torch.nn.CrossEntropyLoss()
-        loss_fn = torch.nn.CrossEntropyLoss(ignore_index=padding_idx)
+        loss_recon = torch.nn.CrossEntropyLoss(ignore_index=padding_idx)
+        loss_y = torch.nn.MSELoss()
 
         # Leave test set
         test_dataset = Subset(tech_dataset, cv_idx[0]['test'])
         test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False, num_workers=8)
         X_test, Y_test = next(iter(test_loader))
-        X_test, Y_test = X_test.to(device, dtype=torch.long), Y_test.to(device, dtype=torch.long)
+        X_test, Y_test = X_test.to(device, dtype=torch.long), Y_test.to(device, dtype=torch.float)
 
-        trues_cv, preds_cv = [], []
+        trues_container_recon_cv, preds_container_recon_cv, trues_container_y_cv, preds_container_y_cv = [], [], [], []
         trained_models, losses_per_fold = {}, {}
         for fold in tqdm(range(n_folds)):
             train_dataset = Subset(tech_dataset, cv_idx[fold]['train'])
@@ -137,11 +137,13 @@ if __name__=="__main__":
 
             enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
 
-            att = Attention(hidden_dim_enc, hidden_dim)
+            att = Attention(hidden_dim, n_directions)
 
-            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, n_directions=n_directions, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
 
-            model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            pred = Predictor(latent_dim=hidden_dim*n_directions*n_layers, hidden_dim=hidden_dim, output_dim=1)
+
+            model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, pred=pred, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
             model = torch.nn.DataParallel(model, device_ids=device_ids)
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -150,8 +152,8 @@ if __name__=="__main__":
                 early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path="../models/ES_checkpoint_"+train_param_name+".ckpt")
             for ep in range(max_epochs):
                 print(f"Epoch {ep+1}\n"+str("-"*25))
-                train_loss = run_epoch(train_loader, model, loss_fn, mode='train', optimizer=optimizer, device=device)
-                val_loss = run_epoch(val_loader, model, loss_fn, mode='test', device=device)
+                train_loss = run_epoch(train_loader, model, loss_recon, loss_y, mode='train', optimizer=optimizer, loss_weights=loss_weights, device=device)
+                val_loss = run_epoch(val_loader, model, loss_recon, loss_y, mode='test', loss_weights=loss_weights, device=device)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
                 print(f"Avg train loss: {train_loss:>5f}, Avg val loss: {val_loss:>5f}\n")
@@ -166,36 +168,44 @@ if __name__=="__main__":
             losses_per_fold[fold] = np.average(val_losses)
 
             X_val_cv, Y_val_cv = next(iter(val_loader_cv))
-            trues_cv.append(Y_val_cv.cpu().detach().numpy())
-            outputs_cv, z_cv = model.module(X_val_cv.to(device=device)) # unwrap data parallel
-            preds_cv.append(outputs_cv.cpu().detach().numpy())
+            trues_container_recon_cv.append(X_val_cv.cpu().detach().numpy())
+            trues_container_y_cv.append(Y_val_cv.cpu().detach().numpy())
+            # outputs_cv, z_cv = model.module(X_val_cv.to(device=device)) # unwrap data parallel
+            preds_recon_cv, preds_y_cv, z_cv = model.module(X_val_cv.to(device=device))
+            preds_container_recon_cv.append(preds_recon_cv.cpu().detach().numpy())
+            preds_container_y_cv.append(preds_y_cv.cpu().detach().numpy())
 
-        trues_cv = np.concatenate(trues_cv)
-        preds_cv = np.concatenate(preds_cv)
+        trues_container_recon_cv = np.concatenate(trues_container_recon_cv)
+        trues_container_y_cv = np.concatenate(trues_container_y_cv)
+        preds_container_recon_cv = np.concatenate(preds_container_recon_cv)
+        preds_container_y_cv = np.concatenate(preds_container_y_cv)
 
         best_model = trained_models[np.argmax(list(losses_per_fold.values()))].module # best model in CV # unwrap data parallel
-        trues_test = Y_test.cpu().detach().numpy()
-        outputs_test, z_test = best_model(X_test)
-        preds_test = outputs_test.cpu().detach().numpy()
+        preds_recon_test, preds_y_test, z_test = best_model(X_test)
+        preds_recon_test = preds_recon_test.cpu().detach().numpy()
+        preds_y_test = preds_y_test.cpu().detach().numpy()
         torch.save(best_model.state_dict(), best_model_path)
 
         # Qaultitative evaluation
-        X_test_class = pd.Series(token2class(X_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
+        trues_y_test = Y_test.cpu().detach().numpy()
+        trues_recon_test_class = pd.Series(token2class(X_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
 
-        preds_test, h_test = best_model(X_test.to(device))
-        preds_test = preds_test.argmax(1)
-        preds_test_class = pd.Series(token2class(preds_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
+        # preds_test, h_test = best_model(X_test.to(device))
+        preds_recon_test = preds_recon_test.argmax(1)
+        preds_recon_test_class = pd.Series(token2class(preds_recon_test.tolist(), vocabulary=tech_dataset.vocab_i2w))
 
-        test_res = pd.concat([X_test_class, preds_test_class], axis=1)
+        test_res = pd.concat([trues_recon_test_class, preds_recon_test_class], axis=1)
         test_res.columns = ['TRUE', 'PRED']
         print(test_res)
 
     else:
         enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec, device=device).to(device=device, dtype=torch.float)
 
-        att = Attention(hidden_dim_enc, hidden_dim)
+        att = Attention(hidden_dim * n_directions, hidden_dim)
 
-        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, hidden_dim_enc=hidden_dim_enc, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, n_directions=n_directions, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+
+        pred = Predictor(latent_dim=hidden_dim*n_directions*n_layers, hidden_dim=hidden_dim, output_dim=1)
 
         best_model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
         best_model = torch.nn.DataParallel(best_model, device_ids=device_ids)
@@ -212,13 +222,13 @@ if __name__=="__main__":
         best_model.load_state_dict(converted_states)
 
         for batch, (X, Y) in enumerate(data_loader):
-            X_class = pd.Series(token2class(X.tolist(), vocabulary=tech_dataset.vocab_i2w))
+            trues_recon_class = pd.Series(token2class(X.tolist(), vocabulary=tech_dataset.vocab_i2w))
 
-            preds, h = best_model(X.to(device))
-            preds = preds.argmax(1)
-            preds_class = pd.Series(token2class(preds.tolist(), vocabulary=tech_dataset.vocab_i2w))
+            preds_recon, preds_y, h = best_model(X.to(device))
+            preds_recon = preds_recon.argmax(1)
+            preds_recon_class = pd.Series(token2class(preds_recon.tolist(), vocabulary=tech_dataset.vocab_i2w))
 
-            test_res = pd.concat([X_class, preds_class], axis=1)
+            test_res = pd.concat([trues_recon_class, preds_recon_class], axis=1)
             test_res.columns = ['TRUE', 'PRED']
             print(test_res)
 
@@ -250,7 +260,8 @@ if __name__=="__main__":
     print(f"Generated output (using the original latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
 
     # What if adding noise to latent vector?
-    new_z = z + z.mean().item() * 1e-2
+    # new_z = z + z.mean().item() * 5e-1
+    new_z = z + torch.rand((z.shape)).to(device) * 1e-4
     new_outputs = torch.zeros(1, tech_dataset.vocab_size, tech_dataset.seq_len)
     next_input = torch.from_numpy(np.tile([tech_dataset.vocab_w2i[TOKEN_SOS]], 1)).to(device)
     for t in range(1, tech_dataset.seq_len):
