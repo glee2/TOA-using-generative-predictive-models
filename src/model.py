@@ -22,60 +22,54 @@ from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
 TOKEN_SOS = '<SOS>'
 TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
 class Encoder_SEQ(nn.Module):
-    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_layers, device, bidirec=False, dropout=0.1, padding_idx=None):
+    def __init__(self, device, params={}):
         super(Encoder_SEQ, self).__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
+        self.embedding_dim = params['embedding_dim']
+        self.hidden_dim = params['hidden_dim']
+        self.n_layers = params['n_layers']
+        self.vocab_size = params['vocab_size']
+        self.bidirec = params['bidirec']
+        self.n_directions = params['n_directions']
+        self.padding_idx = params['padding_idx']
+        self.dropout = params['dropout']
         self.device = device
-        self.vocab_size = vocab_size
-        self.bidirec = bidirec
-        self.n_directions = 2 if self.bidirec else 1
-        # self.hidden_dim_enc = self.hidden_dim * self.n_directions if self.bidirec else self.hidden_dim
 
-        self.gru = nn.GRU(embedding_dim, hidden_dim, n_layers, batch_first=True, bidirectional=bidirec).to(device)
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=padding_idx).to(device)
-        self.dropout = nn.Dropout(dropout).to(device)
-        self.fc = nn.Linear(self.hidden_dim * self.n_directions, hidden_dim)
+        self.gru = nn.GRU(self.embedding_dim, self.hidden_dim, self.n_layers, batch_first=True, bidirectional=self.bidirec)
+        self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim, padding_idx=self.padding_idx)
+        self.dropout = nn.Dropout(self.dropout)
+        self.fc = nn.Linear(self.hidden_dim * self.n_directions, self.hidden_dim)
 
     def forward(self, inputs):
         # inputs: (batch_size, seq_len)
         batch_size = inputs.shape[0]
 
         embedded = self.dropout(self.embedding(inputs)) # (batch_size, seq_len, embedding_dim)
-        hidden = self.initHidden(len(inputs)).to(self.device) # (n_layers * n_directions, batch_size, hidden_dim)
+        hidden = self.initHidden(batch_size) # (n_layers * n_directions, batch_size, hidden_dim)
         output, hidden = self.gru(embedded, hidden)
         # output: (batch_size, seq_len, hidden_dim * n_directions), hidden: (n_layers * n_directions, batch_size, hidden_dim)
 
         hidden = hidden.view(self.n_layers, batch_size, self.hidden_dim * self.n_directions) # Separate layer and direction
         # hidden: (n_layers, batch_size, hidden_dim * n_directions)
 
-        # hidden = hidden.view(self.n_layers, self.n_directions, batch_size, self.hidden_dim) # Separate layer and direction
-        # hidden = hidden[-1].view(batch_size, -1) # hidden weights from the last layer -> (batch_size, hidden_dim_enc)
-
-        # if self.bidirec:
-        #     hidden = torch.tanh(self.fc(torch.cat((hidden[-2,:,:], hidden[-1,:,:]), dim=1))) # (batch_size, hidden_dim)
-        # else:
-        #     hidden = hidden[-1,:,:] # hidden weights from the last layer
-
         return output, hidden
 
     def initHidden(self, batch_size):
-        return torch.zeros(self.n_layers * self.n_directions, batch_size, self.hidden_dim).to(self.device)
+        return torch.zeros((self.n_layers * self.n_directions, batch_size, self.hidden_dim), device=self.device)
 
 class Attention(nn.Module):
-    def __init__(self, hidden_dim, n_directions):
-        super().__init__()
+    def __init__(self, device, params={}):
+        super(Attention, self).__init__()
+        self.hidden_dim = params['hidden_dim']
+        self.n_directions = params['n_directions']
+        self.device = device
 
-        self.attn = nn.Linear((hidden_dim * n_directions) + (hidden_dim * n_directions), hidden_dim)
-        self.v = nn.Linear(hidden_dim, 1, bias=False)
+        self.attn = nn.Linear((self.hidden_dim * self.n_directions) + (self.hidden_dim * self.n_directions), self.hidden_dim)
+        self.v = nn.Linear(self.hidden_dim, 1, bias=False)
 
     def forward(self, hidden, encoder_outputs):
         # hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
@@ -94,21 +88,22 @@ class Attention(nn.Module):
         return F.softmax(attention, dim=1)
 
 class AttnDecoder_SEQ(nn.Module):
-    def __init__(self, embedding_dim, vocab_size, hidden_dim, n_directions, attention, n_layers, device, max_len=99, dropout=0.1):
+    def __init__(self, device, attention, params={}):
         super().__init__()
-        self.embedding_dim = embedding_dim
-        self.vocab_size = vocab_size
-        self.hidden_dim = hidden_dim
-        # self.hidden_dim * n_directions = hidden_dim * n_directions
-        self.n_layers = n_layers
+        self.embedding_dim = params['embedding_dim']
+        self.vocab_size = params['vocab_size']
+        self.hidden_dim = params['hidden_dim']
+        self.n_layers = params['n_layers']
+        self.max_len = params['max_len']
+        self.n_directions = params['n_directions']
+        self.dropout = params['dropout']
         self.device = device
-        self.max_len = max_len
 
         self.attention = attention
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.gru = nn.GRU((hidden_dim * n_directions) + embedding_dim, (hidden_dim * n_directions), n_layers, batch_first=True).to(device)
-        self.fc_out = nn.Linear(embedding_dim + (hidden_dim * n_directions) + (hidden_dim * n_directions), vocab_size)
-        self.dropout = nn.Dropout(dropout)
+        self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
+        self.gru = nn.GRU((self.hidden_dim * self.n_directions) + self.embedding_dim, (self.hidden_dim * self.n_directions), self.n_layers, batch_first=True)
+        self.fc_out = nn.Linear(self.embedding_dim + (self.hidden_dim * self.n_directions) + (self.hidden_dim * self.n_directions), self.vocab_size)
+        self.dropout = nn.Dropout(self.dropout)
 
     def forward(self, inputs, hidden, encoder_outputs):
         # inputs: (batch_size), hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
@@ -134,14 +129,20 @@ class AttnDecoder_SEQ(nn.Module):
         return prediction, hidden
 
 class Predictor(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, output_dim, dropout=0.75):
+    def __init__(self, device, params={}):
         super(Predictor, self).__init__()
-        self.linear = nn.Linear(latent_dim, hidden_dim).float()
-        self.linear2 = nn.Linear(hidden_dim, hidden_dim).float()
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.out = nn.Linear(hidden_dim, output_dim).float()
+        self.latent_dim = params['latent_dim']
+        self.hidden_dim = params['hidden_dim']
+        self.output_dim = params['output_dim_predictor']
+        self.dropout = params['dropout']
+        self.device = device
+
+        self.linear = nn.Linear(self.latent_dim, self.hidden_dim).float()
+        self.linear2 = nn.Linear(self.hidden_dim, self.hidden_dim).float()
+        self.bn1 = nn.BatchNorm1d(self.hidden_dim)
+        self.bn2 = nn.BatchNorm1d(self.hidden_dim)
+        self.dropout = nn.Dropout(self.dropout)
+        self.out = nn.Linear(self.hidden_dim, self.output_dim).float()
 
     def forward(self, x):
         hidden = F.relu(self.bn1(self.linear(x)))
@@ -152,40 +153,37 @@ class Predictor(nn.Module):
         return pred
 
 class SEQ2SEQ(nn.Module):
-    def __init__(self, device='cpu', dataset=None, enc=None, dec=None, pred=None, max_len=99, u=0.5):
+    def __init__(self, device, enc=None, dec=None, pred=None, vocab={}, max_len=99, u=0.5):
         super(SEQ2SEQ, self).__init__()
-        self.device = device
-        self.dataset = dataset
         self.encoder = enc
         self.decoder = dec
         self.predictor = pred
+        self.vocab = vocab
         self.max_len = max_len
         self.u = u
+        self.device = device
 
     def forward(self, x, teach_force_ratio=0.75):
         # x: (batch_size, seq_len)
         batch_size = x.size(0)
         vocab_size = self.decoder.vocab_size
 
-        outputs = torch.zeros(batch_size, vocab_size, self.max_len).to(device=self.device) # (batch_size, vocab_size, seq_len)
-        outputs[:,self.dataset.vocab_w2i[TOKEN_SOS],0] = 1.
+        outputs = torch.zeros((batch_size, vocab_size, self.max_len), device=self.device) # (batch_size, vocab_size, seq_len)
+        outputs[:,self.vocab[TOKEN_SOS],0] = 1.
 
-        # encoder_outputs = torch.zeros(self.max_len, self.encoder.hidden_dim, device=self.device)
         encoder_output, z = self.encoder(x)
         # encoder_output: (batch_size, seq_len, hidden_dim * n_directions), z: (n_layers, batch_size, hidden_dim * n_directions)
 
         next_hidden = z
-        next_input = torch.from_numpy(np.tile([self.dataset.vocab_w2i[TOKEN_SOS]], batch_size)).to(device=self.device) # (batch_size)
+        next_input = torch.tensor(np.tile([self.vocab[TOKEN_SOS]], batch_size), device=self.device) # (batch_size)
         for t in range(1, self.max_len):
             output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, encoder_output)
             # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim * n_directions), pred_token: (batch_size)
 
             rand_num = np.random.random()
             if rand_num < teach_force_ratio:
-                # next_input = x[:,t].unsqueeze(1)
                 next_input = x[:,t] # (batch_size)
             else:
-                # next_input = pred_token.unsqueeze(1)
                 next_input = pred_token # (batch_size)
             outputs[:,:,t] = output
 
@@ -204,7 +202,7 @@ class SEQ2SEQ(nn.Module):
         if pred_token.size() == torch.Size([]):
             print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
 
-        if self.dataset.vocab_w2i[TOKEN_EOS] in next_input.view(-1):
-            pred_token[next_input.view(-1)==self.dataset.vocab_w2i[TOKEN_EOS]] = self.dataset.vocab_w2i[TOKEN_PAD]
+        if self.vocab[TOKEN_EOS] in next_input.view(-1):
+            pred_token[next_input.view(-1)==self.vocab[TOKEN_EOS]] = self.vocab[TOKEN_PAD]
 
         return output, hidden, pred_token

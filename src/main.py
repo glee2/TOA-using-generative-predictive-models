@@ -77,20 +77,24 @@ if __name__=="__main__":
         device = torch.device('cpu')
         device_ids = []
 
-    # Set hyperparameters
+    ## Set hyperparameters for model training
+    n_layers = args.n_layers
+    bidirec = args.bidirec
+    n_directions = 2 if bidirec else 1
+    embedding_dim = args.embedding_dim
+    hidden_dim = args.hidden_dim
+    latent_dim = hidden_dim*n_layers*n_directions
+    output_dim_predictor = 1
     n_folds = args.n_folds
     learning_rate = args.learning_rate
     batch_size = args.batch_size
     max_epochs = args.max_epochs
-    embedding_dim = args.embedding_dim
-    hidden_dim = args.hidden_dim
-    n_layers = args.n_layers
-    bidirec = args.bidirec
-    n_directions = 2 if bidirec else 1
+    dropout = 0.5
+    loss_weights = {'recon': 3, 'y': 7}
 
+    ## Set target field of technologies and level of analysis
     target_ipc = args.target_ipc
     ipc_level = args.ipc_level
-    loss_weights = {'recon': 3, 'y': 7}
 
     use_early_stopping = False if args.no_early_stopping else True
     if use_early_stopping: early_stop_patience = int(0.3*max_epochs)
@@ -99,6 +103,11 @@ if __name__=="__main__":
     best_model_path = os.path.join(root_dir, "models", f"[CV_best_model][{target_ipc}]{train_param_name}.ckpt")
 
     train_params = {'target_ipc': target_ipc, 'ipc_level': ipc_level}
+    model_params = copy.deepcopy(vars(args))
+    model_params.update({'n_directions': n_directions,
+                         'latent_dim': latent_dim,
+                         'output_dim_predictor': output_dim_predictor,
+                         'dropout': dropout})
 
     # Sampling for cross validation
     print("Load dataset...")
@@ -108,15 +117,17 @@ if __name__=="__main__":
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
 
+    model_params.update({'vocabulary': tech_dataset.vocab_w2i,
+                         'padding_idx': tech_dataset.vocab_w2i[TOKEN_PAD],
+                         'vocab_size': tech_dataset.vocab_size,
+                         'max_len': tech_dataset.seq_len})
+
     if args.train:
         sampler = CVSampler(tech_dataset, n_folds=n_folds, test_ratio=0.3)
         cv_idx = sampler.get_idx_dict()
         print(f"#Samples\nTrain: {len(cv_idx[0]['train'])}, Validation: {len(cv_idx[0]['val'])}, Test: {len(cv_idx[0]['test'])}")
 
-        # Ignoring padding index
-        padding_idx = tech_dataset.vocab_w2i[TOKEN_PAD]
-        # loss_fn = torch.nn.CrossEntropyLoss()
-        loss_recon = torch.nn.CrossEntropyLoss(ignore_index=padding_idx)
+        loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['padding_idx'])
         loss_y = torch.nn.MSELoss()
 
         # Leave test set
@@ -135,15 +146,15 @@ if __name__=="__main__":
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
             val_loader_cv = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, num_workers=8)
 
-            enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec,  device=device).to(device=device, dtype=torch.float)
+            enc = Encoder_SEQ(device=device, params=model_params).to(device=device, dtype=torch.float)
 
-            att = Attention(hidden_dim, n_directions)
+            att = Attention(device=device, params=model_params).to(device=device, dtype=torch.float)
 
-            dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, n_directions=n_directions, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            dec = AttnDecoder_SEQ(device=device, attention=att, params=model_params).to(device=device, dtype=torch.float)
 
-            pred = Predictor(latent_dim=hidden_dim*n_directions*n_layers, hidden_dim=hidden_dim, output_dim=1)
+            pred = Predictor(device=device, params=model_params).to(device=device, dtype=torch.float)
 
-            model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, pred=pred, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+            model = SEQ2SEQ(device=device, enc=enc, dec=dec, pred=pred, vocab=model_params['vocabulary'], max_len=model_params['max_len']).to(device=device, dtype=torch.float)
             model = torch.nn.DataParallel(model, device_ids=device_ids)
             optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -199,15 +210,15 @@ if __name__=="__main__":
         print(test_res)
 
     else:
-        enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=tech_dataset.vocab_size, n_layers=n_layers, bidirec=bidirec, device=device).to(device=device, dtype=torch.float)
+        enc = Encoder_SEQ(embedding_dim=embedding_dim, hidden_dim=hidden_dim, vocab_size=model_params['vocab_size'], n_layers=n_layers, bidirec=bidirec, device=device).to(device=device, dtype=torch.float)
 
         att = Attention(hidden_dim * n_directions, hidden_dim)
 
-        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=tech_dataset.vocab_size, hidden_dim=hidden_dim, n_directions=n_directions, attention=att, n_layers=n_layers, device=device, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+        dec = AttnDecoder_SEQ(embedding_dim=embedding_dim, vocab_size=model_params['vocab_size'], hidden_dim=hidden_dim, n_directions=n_directions, attention=att, n_layers=n_layers, device=device, max_len=model_params['max_len']).to(device=device, dtype=torch.float)
 
         pred = Predictor(latent_dim=hidden_dim*n_directions*n_layers, hidden_dim=hidden_dim, output_dim=1)
 
-        best_model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=tech_dataset.seq_len).to(device=device, dtype=torch.float)
+        best_model = SEQ2SEQ(device=device, dataset=tech_dataset, enc=enc, dec=dec, max_len=model_params['max_len']).to(device=device, dtype=torch.float)
         best_model = torch.nn.DataParallel(best_model, device_ids=device_ids)
 
         best_states = torch.load(best_model_path)
@@ -244,9 +255,9 @@ if __name__=="__main__":
     # Take the last layer hidden vector as latent vector
     # z = z[-1].view(1, batch_size, -1) # last layer hidden_vector -> (1, batch_size, hidden_dim * n_directions)
     z = h_enc
-    new_outputs = torch.zeros(1, tech_dataset.vocab_size, tech_dataset.seq_len)
-    next_input = torch.from_numpy(np.tile([tech_dataset.vocab_w2i[TOKEN_SOS]], 1)).to(device)
-    for t in range(1, tech_dataset.seq_len):
+    new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
+    next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
+    for t in range(1, model_params['max_len']):
         embedded = dec.dropout(dec.embedding(next_input.unsqueeze(1)))
         gru_input = torch.cat((embedded, z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
         o_dec, h_dec = dec.gru(gru_input, z)
@@ -262,9 +273,9 @@ if __name__=="__main__":
     # What if adding noise to latent vector?
     # new_z = z + z.mean().item() * 5e-1
     new_z = z + torch.rand((z.shape)).to(device) * 1e-4
-    new_outputs = torch.zeros(1, tech_dataset.vocab_size, tech_dataset.seq_len)
-    next_input = torch.from_numpy(np.tile([tech_dataset.vocab_w2i[TOKEN_SOS]], 1)).to(device)
-    for t in range(1, tech_dataset.seq_len):
+    new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
+    next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
+    for t in range(1, model_params['max_len']):
         embedded = dec.dropout(dec.embedding(next_input.unsqueeze(1)))
         gru_input = torch.cat((embedded, new_z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
         o_dec, h_dec = dec.gru(gru_input, h_enc)

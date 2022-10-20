@@ -49,7 +49,10 @@ class TechDataset(Dataset):
         self.rawdata = pd.read_csv(os.path.join(data_dir, "collection_final.csv"))
 
         self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess(target_ipc=self.params['target_ipc'], ipc_level=self.params['ipc_level'], n_TC=self.params['n_TC'])
+        self.original_idx = np.array(self.data.index)
         self.X, self.Y = self.make_io()
+
+        self.oversampled_idx = self.resampled_idx = np.array([])
 
     def make_io(self, val_main=10, val_sub=1):
         X_df = pd.DataFrame(index=self.data.index)
@@ -78,8 +81,6 @@ class TechDataset(Dataset):
         rawdata_tc = self.rawdata.loc[rawdata_ipc.index][['year']+cols_year]
 
         data = rawdata_ipc[['number']].copy(deep=True)
-        # data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: x.replace(' ',''))
-        # data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: x.replace(' ','').split(';'))
         assert ipc_level in [1,2,3], f"Not implemented for an IPC level {ipc_level}"
         if ipc_level == 1:
             data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0][:3])
@@ -94,7 +95,6 @@ class TechDataset(Dataset):
         data = data.set_index('number')
         seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
 
-        # main_ipcs = [target_ipc]
         main_ipcs = list(np.unique(data['main_ipc']))
         sub_ipcs = list(np.unique(np.concatenate(list(data['sub_ipc'].values))))
         all_ipcs = list(np.union1d(main_ipcs, sub_ipcs))
@@ -117,17 +117,21 @@ class TechDataset(Dataset):
             X, Y = self.X[idx], self.Y[idx]
         return X, Y
 
+'''
+!!!!! 여기 수정해야함(221020) !!!!!
+'''
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify
         self.oversampled = oversampled
-        if self.stratify:
-            self.labels = dataset.metadata_res['target']
-            self.whole_idx = np.array(self.img_labels.index)
+        self.labels = dataset.Y
         if self.oversampled:
             self.oversampled_idx = np.intersect1d(dataset.oversampled_idx, dataset.resampled_idx)
             self.original_idx = np.intersect1d(dataset.original_idx, dataset.resampled_idx)
-            self.labels_org = self.labels.loc[self.original_idx]
+            # self.labels_org = self.labels.loc[self.original_idx]
+        else:
+            self.original_idx = dataset.original_idx
+            self.oversampled_idx = dataset.oversampled_idx
 
         self.dataset = dataset
         self.test_ratio = test_ratio
@@ -141,8 +145,7 @@ class CVSampler:
     def split(self):
         if self.stratify:
             splitter = StratifiedShuffleSplit(n_splits=1, test_size=self.test_ratio, random_state=self.random_state)
-            for train_idx, test_idx in splitter.split(np.zeros(len(self.labels_org)), self.img_labels_org):
-                # self.train_samples_idx = train_idx
+            for train_idx, test_idx in splitter.split(np.zeros(len(self.labels)), self.labels):
                 self.train_samples_idx = np.random.permutation(np.union1d(self.original_idx[train_idx], self.oversampled_idx))
                 self.test_samples_idx = self.original_idx[test_idx]
             if self.n_folds == 1:
@@ -150,7 +153,7 @@ class CVSampler:
             else:
                 kf_splitter = StratifiedKFold(n_splits=self.n_folds, random_state=self.random_state, shuffle=True)
                 fold = 0
-                for train_idx, val_idx in kf_splitter.split(np.zeros(len(self.train_samples_idx)), self.labels.loc[self.train_samples_idx]):
+                for train_idx, val_idx in kf_splitter.split(np.zeros(len(self.train_samples_idx)), self.labels[self.train_samples_idx]):
                     self.idx_dict[fold] = {'train': self.train_samples_idx[train_idx], 'val': self.train_samples_idx[val_idx], 'test': self.test_samples_idx}
                     fold += 1
         else:
@@ -164,7 +167,7 @@ class CVSampler:
             else:
                 kf_splitter = KFold(n_splits=self.n_folds, random_state=self.random_state, shuffle=True)
                 fold = 0
-                for train_idx, val_idx in skf.split(np.zeros(len(self.train_samples_idx)), self.labels.loc[self.train_samples_idx]):
+                for train_idx, val_idx in kf_splitter.split(np.zeros(len(self.train_samples_idx)), self.labels[self.train_samples_idx]):
                     self.idx_dict[fold] = {'train': self.train_samples_idx[train_idx], 'val': self.train_samples_idx[val_idx], 'test': self.test_samples_idx}
                     fold += 1
 
