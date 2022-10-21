@@ -110,7 +110,7 @@ if __name__=="__main__":
         learning_rate = args.learning_rate
         batch_size = args.batch_size
 
-        train_param_name = f"{n_layers}layers_{embedding_dim}emb_{hidden_dim}hid_{np.round(learning_rate,4)}lr_{batch_size}batch_{max_epochs}ep"
+        train_param_name = f"{n_layers}layers_{embedding_dim}emb_{hidden_dim}hid_{n_directions}direc_{np.round(learning_rate,4)}lr_{batch_size}batch_{max_epochs}ep"
         final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
 
     use_early_stopping = False if args.no_early_stopping else True
@@ -167,7 +167,7 @@ if __name__=="__main__":
             train_params.update({k: v for k,v in best_params.items() if k in train_params.keys()})
             model_params.update({k: v for k,v in best_params.items() if k in model_params.keys()})
 
-            train_param_name = f"{model_params['n_layers']}layers_{model_params['embedding_dim']}emb_{model_params['hidden_dim']}hid_{np.round(train_params['learning_rate'],4)}lr_{train_params['batch_size']}batch_{train_params['max_epochs']}ep"
+            train_param_name = f"{model_params['n_layers']}layers_{model_params['embedding_dim']}emb_{model_params['hidden_dim']}hid_{model_params['n_directions']}direc_{np.round(train_params['learning_rate'],4)}lr_{train_params['batch_size']}batch_{train_params['max_epochs']}ep"
             final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
 
         ## Construct datasets
@@ -189,7 +189,7 @@ if __name__=="__main__":
         ## Load best model
         final_model = build_model(model_params)
         if args.tune:
-            best_states = torch.load(f"{train_params['model_path']}_{study.best_trial.number}trial.ckpt")
+            best_states = torch.load(os.path.join(train_params['model_path'],f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
             for k, v in best_states.items():
                 if 'module' not in k:
@@ -219,6 +219,8 @@ if __name__=="__main__":
             eval_y_res.to_excel(writer, sheet_name="Regression")
             eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
             eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+
+        print("Training is done!")
     else:
         final_model = build_model(model_params)
         best_states = torch.load(final_model_path)
