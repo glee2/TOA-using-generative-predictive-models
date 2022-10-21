@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.3
-Description (primary changes): Add BatchNorm
+Version: 0.4
+Description (primary changes): Hyperparameter tuning
 '''
 
 # Set root directory

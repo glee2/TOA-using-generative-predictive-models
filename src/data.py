@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.3
-Description (primary changes): Add ipc_level
+Version: 0.4
+Description (primary changes): Hyperparameter tuning
 '''
 
 # Set root directory

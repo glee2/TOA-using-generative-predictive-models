@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.3
-Description (primary changes): Add loss_weights
+Version: 0.4
+Description (primary changes): Add functions for hyperparameter tuning
 '''
 
 # Set root directory
