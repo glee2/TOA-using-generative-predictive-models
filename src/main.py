@@ -31,6 +31,8 @@ from torch.nn import DataParallel as DP
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 
 import optuna
+from optuna.samplers import RandomSampler, TPESampler
+from optuna.integration import SkoptSampler
 
 import numpy as np
 import pandas as pd
@@ -124,8 +126,8 @@ if __name__=="__main__":
                          'early_stop_patience': early_stop_patience,
                          'train_param_name': train_param_name,
                          'model_path': model_path,
-                         'max_epochs_for_tune': 50,
-                         'early_stop_patience_for_tune': 20})
+                         'max_epochs_for_tune': 25,
+                         'early_stop_patience_for_tune': 10})
     model_params = copy.deepcopy(vars(args))
     model_params.pop('train') # To avoid conflict
     model_params.update({'device': device,
@@ -156,8 +158,14 @@ if __name__=="__main__":
         if args.tune:
             optuna_obj = lambda trial: objective_cv(trial, dataset=tech_dataset, cv_idx=cv_idx, model_params=model_params, train_params=train_params)
 
+            # opt_sampler = SkoptSampler(
+            #     skopt_kwargs={'n_random_starts': 5,
+            #                   'acq_func': 'EI',
+            #                   'acq_func_kwargs': {'xi': 0.02}})
+            # opt_sampler = RandomSampler()
+            opt_sampler = TPESampler()
             study = optuna.create_study(direction='minimize')
-            study.optimize(optuna_obj, n_trials=args.n_trials, timeout=600)
+            study.optimize(optuna_obj, n_trials=args.n_trials, gc_after_trial=True)
             best_params = study.best_trial.params
 
             print(f"Best trial:\n  MSE: {study.best_trial.value}\n  Params:")
@@ -220,7 +228,7 @@ if __name__=="__main__":
             eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
             eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
 
-        print("Training is done!")
+        print("Training is done!\n")
     else:
         final_model = build_model(model_params)
         best_states = torch.load(final_model_path)

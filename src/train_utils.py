@@ -96,8 +96,7 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
             preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
             trues_recon = X.clone()
             trues_y = Y.clone()
-            # print(f"Recon loss: {loss_recon(preds_recon, trues_recon)}, Y loss: {loss_y(preds_y, trues_y)}")
-            # loss = loss_recon(preds_recon, trues_recon) + loss_y(preds_y, trues_y)*10
+
             batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
             batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
             batch_loss_total = sum([batch_loss_recon, batch_loss_y])
@@ -105,9 +104,6 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
             loss_out['recon'].append(batch_loss_recon.item())
             loss_out['y'].append(batch_loss_y.item())
             loss_out['total'].append(batch_loss_total.item())
-
-            # loss = sum([loss_weights['recon']*loss_recon(preds_recon, trues_recon), loss_weights['y']*loss_y(preds_y, trues_y)])
-            # batch_losses.append(loss.item())
 
             optimizer.zero_grad()
             # batch_loss_total.sum().backward()
@@ -127,9 +123,6 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
                 preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
                 trues_recon = X.clone()
                 trues_y = Y.clone()
-                # loss = loss_recon(preds_recon, trues_recon) + loss_y(preds_y, trues_y)*10
-                # loss = sum([loss_recon(preds_recon, trues_recon), loss_y(preds_y, trues_y)*5])
-                # loss = sum([loss_weights['recon']*loss_recon(preds_recon, trues_recon), loss_weights['y']*loss_y(preds_y, trues_y)])
 
                 batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
                 batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
@@ -149,7 +142,7 @@ def build_model(model_params={}, trial=None):
 
     if trial is not None:
         model_params['n_layers'] = trial.suggest_int("n_layers", 1, 3)
-        model_params['embedding_dim'] = trial.suggest_categorical("embedding_dim", [64, 128, 256])
+        model_params['embedding_dim'] = trial.suggest_categorical("embedding_dim", [32, 64, 128, 256])
         model_params['hidden_dim'] = trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512])
         model_params['latent_dim'] = trial.suggest_int("latent_dim", model_params['hidden_dim'] * model_params['n_layers'] * model_params['n_directions'], model_params['hidden_dim'] * model_params['n_layers'] * model_params['n_directions'])
 
@@ -171,8 +164,6 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     loss_y = torch.nn.MSELoss()
 
     if trial is not None:
-        # optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "RMSprop", "SGD"])
-        # optimizer = getattr(optim, optimizer_name)(model.parameters(), lr=train_params["learning_rate"])
         train_params['learning_rate'] = trial.suggest_float("learning_rate", 1e-5, 1e-1, log=True)
 
         max_epochs = train_params['max_epochs_for_tune']
@@ -246,7 +237,7 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
         trained_models.append(model)
 
     best_model = trained_models[np.argmax(scores)].module
-    torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_path'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
+    torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_path'],"hparam_tuning",f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
 
     return np.mean(scores)
 

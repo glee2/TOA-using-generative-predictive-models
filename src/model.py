@@ -132,6 +132,7 @@ class Predictor(nn.Module):
         hidden = F.relu(self.bn2(self.linear2(hidden)))
         hidden = self.dropout(hidden)
         pred = self.out(hidden)
+        pred = F.relu(pred)
 
         return pred
 
