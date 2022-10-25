@@ -27,24 +27,10 @@ TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
 class Encoder_SEQ(nn.Module):
-<<<<<<< HEAD
-    def __init__(self, device, params={}):
-        super(Encoder_SEQ, self).__init__()
-        self.embedding_dim = params['embedding_dim']
-        self.hidden_dim = params['hidden_dim']
-        self.n_layers = params['n_layers']
-        self.vocab_size = params['vocab_size']
-        self.bidirec = params['bidirec']
-        self.n_directions = params['n_directions']
-        self.padding_idx = params['padding_idx']
-        self.dropout = params['dropout']
-        self.device = device
-=======
     def __init__(self, params={}):
         super(Encoder_SEQ, self).__init__()
         for key, value in params.items():
             setattr(self, key, value)
->>>>>>> hparam_tune
 
         self.gru = nn.GRU(self.embedding_dim, self.hidden_dim, self.n_layers, batch_first=True, bidirectional=self.bidirec)
         self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim, padding_idx=self.padding_idx)
@@ -69,18 +55,10 @@ class Encoder_SEQ(nn.Module):
         return torch.zeros((self.n_layers * self.n_directions, batch_size, self.hidden_dim), device=self.device)
 
 class Attention(nn.Module):
-<<<<<<< HEAD
-    def __init__(self, device, params={}):
-        super(Attention, self).__init__()
-        self.hidden_dim = params['hidden_dim']
-        self.n_directions = params['n_directions']
-        self.device = device
-=======
     def __init__(self, params={}):
         super(Attention, self).__init__()
         for key, value in params.items():
             setattr(self, key, value)
->>>>>>> hparam_tune
 
         self.attn = nn.Linear((self.hidden_dim * self.n_directions) + (self.hidden_dim * self.n_directions), self.hidden_dim)
         self.v = nn.Linear(self.hidden_dim, 1, bias=False)
@@ -102,23 +80,10 @@ class Attention(nn.Module):
         return F.softmax(attention, dim=1)
 
 class AttnDecoder_SEQ(nn.Module):
-<<<<<<< HEAD
-    def __init__(self, device, attention, params={}):
-        super().__init__()
-        self.embedding_dim = params['embedding_dim']
-        self.vocab_size = params['vocab_size']
-        self.hidden_dim = params['hidden_dim']
-        self.n_layers = params['n_layers']
-        self.max_len = params['max_len']
-        self.n_directions = params['n_directions']
-        self.dropout = params['dropout']
-        self.device = device
-=======
     def __init__(self, attention, params={}):
         super().__init__()
         for key, value in params.items():
             setattr(self, key, value)
->>>>>>> hparam_tune
 
         self.attention = attention
         self.embedding = nn.Embedding(self.vocab_size, self.embedding_dim)
@@ -150,31 +115,17 @@ class AttnDecoder_SEQ(nn.Module):
         return prediction, hidden
 
 class Predictor(nn.Module):
-<<<<<<< HEAD
-    def __init__(self, device, params={}):
-        super(Predictor, self).__init__()
-        self.latent_dim = params['latent_dim']
-        self.hidden_dim = params['hidden_dim']
-        self.output_dim = params['output_dim_predictor']
-        self.dropout = params['dropout']
-        self.device = device
-=======
     def __init__(self, params={}):
         super(Predictor, self).__init__()
         for key, value in params.items():
             setattr(self, key, value)
->>>>>>> hparam_tune
 
         self.linear = nn.Linear(self.latent_dim, self.hidden_dim).float()
         self.linear2 = nn.Linear(self.hidden_dim, self.hidden_dim).float()
         self.bn1 = nn.BatchNorm1d(self.hidden_dim)
         self.bn2 = nn.BatchNorm1d(self.hidden_dim)
         self.dropout = nn.Dropout(self.dropout)
-<<<<<<< HEAD
-        self.out = nn.Linear(self.hidden_dim, self.output_dim).float()
-=======
         self.out = nn.Linear(self.hidden_dim, self.output_dim_predictor).float()
->>>>>>> hparam_tune
 
     def forward(self, x):
         hidden = F.relu(self.bn1(self.linear(x)))

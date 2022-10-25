@@ -117,9 +117,6 @@ class TechDataset(Dataset):
             X, Y = self.X[idx], self.Y[idx]
         return X, Y
 
-'''
-!!!!! 여기 수정해야함(221020) !!!!!
-'''
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify

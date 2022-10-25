@@ -126,38 +126,6 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
                 preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
                 trues_recon = X.clone()
                 trues_y = Y.clone()
-<<<<<<< HEAD
-                # loss = loss_recon(preds_recon, trues_recon) + loss_y(preds_y, trues_y)*10
-                # loss = sum([loss_recon(preds_recon, trues_recon), loss_y(preds_y, trues_y)*5])
-                loss = sum([loss_weights['recon']*loss_recon(preds_recon, trues_recon), loss_weights['y']*loss_y(preds_y, trues_y)])
-                test_loss += loss.item()
-                batch_losses.append(loss.item())
-        test_loss /= n_batches
-        # print(f"Avg loss: {test_loss:>8f}\n")
-
-    return np.average(batch_losses)
-
-
-
-def perf_eval(model_name, trues, preds):
-    metric_list = ['Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
-    eval_res = pd.DataFrame(columns=metric_list)
-    preds_binary = preds.argmax(1)
-
-    conf_mat = confusion_matrix(trues, preds_binary)
-    tn, fp, fn, tp = conf_mat.ravel()
-
-    acc = (tn+tp)/conf_mat.sum()
-    rec = tp/(tp+fn)
-    pre = tp/(tp+fp)
-    spe = tn/(tn+fp)
-    npv = tn/(tn+fn)
-    f1 = 2*((pre*rec)/(pre+rec))
-
-    eval_res = pd.DataFrame([[model_name,len(trues),acc,rec,pre,f1,spe,npv]], columns=['Model','Support']+metric_list).set_index('Model').apply(np.round, axis=0, decimals=4)
-
-    return eval_res, conf_mat
-=======
 
                 batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
                 batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
@@ -325,4 +293,3 @@ def perf_eval(model_name, trues, preds, pred_type='regression', vocabulary=None)
     else:
         print(f"Not implemented for {pred_type} type.")
         return
->>>>>>> hparam_tune
