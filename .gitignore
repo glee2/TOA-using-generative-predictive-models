@@ -3,3 +3,4 @@ src_backup/*
 src/__pycache__/*
 results/*
 data/*
+data/collection_final_with_claims.csv
