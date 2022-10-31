@@ -2,4 +2,4 @@ models/*
 src_backup/*
 src/__pycache__/*
 results/*
-data/USPTO-2m/*
+data/*

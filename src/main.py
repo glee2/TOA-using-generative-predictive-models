@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.4
-Description (primary changes): Hyperparameter tuning
+Version: 0.5
+Description (primary changes): Use patent claims as input data
 '''
 
 # Set root directory
@@ -52,7 +52,7 @@ TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_type', default='sequence')
+parser.add_argument('--data_type', default='class', help="Type of input data. class / claim")
 parser.add_argument('--train', default=False, action='store_true')
 parser.add_argument('--tune', default=False, action='store_true')
 parser.add_argument('--n_trials', default=2, type=int)
@@ -67,6 +67,8 @@ parser.add_argument('--n_layers', default=1, type=int)
 parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
 parser.add_argument('--target_ipc', default='A23L', type=str)
 parser.add_argument('--ipc_level', default=3, type=int, help="IPC level. 1: Section-Class, 2: Section-Class-Sub Class, 3: Section-Class-Sub Class-Group(main or sub)")
+parser.add_argument('--claim_level', default=1, type=int, help="Claim level. 1: First claim, 2: Second claim, ..., -1: Use all claims")
+parser.add_argument('--n_TC', default=3, type=int, help="number of years for counting the number of forward citations of patent")
 parser.add_argument('--bidirec', default=False, action='store_true')
 
 if __name__=="__main__":
@@ -140,7 +142,7 @@ if __name__=="__main__":
     # Sampling for cross validation
     print("Load dataset...")
     tstart = time.time()
-    tech_dataset = TechDataset(device=device, data_dir=data_dir, do_transform=False, params=train_params)
+    tech_dataset = TechDataset(data_dir=data_dir, do_transform=False, params=train_params)
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
 
