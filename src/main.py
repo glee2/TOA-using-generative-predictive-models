@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.4
-Description (primary changes): Hyperparameter tuning
+Version: 0.6
+Description (primary changes): Add classification
 '''
 
 # Set root directory
@@ -29,6 +29,7 @@ import torch
 from torch.nn import functional as F
 from torch.nn import DataParallel as DP
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+import pytorch_model_summary
 
 import optuna
 from optuna.samplers import RandomSampler, TPESampler
@@ -43,7 +44,7 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
+from models import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor, EncPred
 from train_utils import run_epoch, EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model
 from utils import token2class
 
@@ -52,7 +53,8 @@ TOKEN_EOS = '<EOS>'
 TOKEN_PAD = '<PAD>'
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_type', default='sequence')
+parser.add_argument('--data_type', default='class', help="Type of input data. class / claim")
+parser.add_argument('--pred_type', default='regression', help="Type of prediction. regression/classification")
 parser.add_argument('--train', default=False, action='store_true')
 parser.add_argument('--tune', default=False, action='store_true')
 parser.add_argument('--n_trials', default=2, type=int)
@@ -67,6 +69,8 @@ parser.add_argument('--n_layers', default=1, type=int)
 parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
 parser.add_argument('--target_ipc', default='A23L', type=str)
 parser.add_argument('--ipc_level', default=3, type=int, help="IPC level. 1: Section-Class, 2: Section-Class-Sub Class, 3: Section-Class-Sub Class-Group(main or sub)")
+parser.add_argument('--claim_level', default=1, type=int, help="Claim level. 1: First claim, 2: Second claim, ..., -1: Use all claims")
+parser.add_argument('--n_TC', default=3, type=int, help="number of years for counting the number of forward citations of patent")
 parser.add_argument('--bidirec', default=False, action='store_true')
 
 if __name__=="__main__":
@@ -86,10 +90,11 @@ if __name__=="__main__":
     ## Set hyperparameters for model training (FIXED)
     bidirec = args.bidirec
     n_directions = 2 if bidirec else 1
-    output_dim_predictor = 1
+    output_dim_predictor = 1 if args.pred_type=="regression" else 2
+    # output_dim_predictor = 1
     n_folds = args.n_folds
     max_epochs = args.max_epochs
-    dropout = 0.5
+    drop_prob = 0.5
     loss_weights = {'recon': 2, 'y': 8}
     model_path = os.path.join(root_dir, "models")
 
@@ -134,13 +139,12 @@ if __name__=="__main__":
                          'device_ids': device_ids,
                          'n_directions': n_directions,
                          'latent_dim': latent_dim,
-                         'output_dim_predictor': output_dim_predictor,
-                         'dropout': dropout})
+                         'drop_prob': drop_prob})
 
     # Sampling for cross validation
     print("Load dataset...")
     tstart = time.time()
-    tech_dataset = TechDataset(device=device, data_dir=data_dir, do_transform=False, params=train_params)
+    tech_dataset = TechDataset(data_dir=data_dir, do_transform=False, params=train_params)
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
 
@@ -148,10 +152,11 @@ if __name__=="__main__":
                          'vocabulary_rev': tech_dataset.vocab_i2w,
                          'padding_idx': tech_dataset.vocab_w2i[TOKEN_PAD],
                          'vocab_size': tech_dataset.vocab_size,
-                         'max_len': tech_dataset.seq_len})
+                         'max_len': tech_dataset.seq_len,
+                         'output_dim_predictor': tech_dataset.n_classes})
 
     if args.train:
-        sampler = CVSampler(tech_dataset, n_folds=n_folds, test_ratio=0.3)
+        sampler = CVSampler(tech_dataset, n_folds=n_folds, test_ratio=0.3, stratify=True)
         cv_idx = sampler.get_idx_dict()
         print(f"#Samples\nTrain: {len(cv_idx[0]['train'])}, Validation: {len(cv_idx[0]['val'])}, Test: {len(cv_idx[0]['test'])}")
 
@@ -196,6 +201,8 @@ if __name__=="__main__":
 
         ## Load best model
         final_model = build_model(model_params)
+        x_input, _ = next(iter(train_loader))
+        print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
         if args.tune:
             best_states = torch.load(os.path.join(train_params['model_path'],f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
@@ -211,22 +218,27 @@ if __name__=="__main__":
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
         ## Evaluation on train dataset
-        trues_recon_train, trues_y_train, preds_recon_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
-        eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type='regression')
+        # trues_recon_train, trues_y_train, preds_recon_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
+        trues_y_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
+        # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
+        eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=args.pred_type)
+        if args.pred_type == "classification":
+            eval_y_train, confmat_y_train = eval_y_train
 
         ## Evaluation on test dataset
-        trues_recon_test, trues_y_test, preds_recon_test, preds_y_test = validate_model(final_model, test_loader, model_params)
-        eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type='regression')
+        trues_y_test, preds_y_test = validate_model(final_model, test_loader, model_params)
+        # eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
+        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=args.pred_type)
+        if args.pred_type == "classification":
+            eval_y_test, confmat_y_test = eval_y_test
 
         eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
 
         result_path = os.path.join(root_dir, "results")
-        with pd.ExcelWriter(os.path.join(result_path,f"[RESULT][{args.target_ipc}]{train_param_name}.xlsx")) as writer:
-            eval_y_res.to_excel(writer, sheet_name="Regression")
-            eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
-            eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+        # with pd.ExcelWriter(os.path.join(result_path,f"[RESULT][{args.target_ipc}]{train_param_name}.xlsx")) as writer:
+        #     eval_y_res.to_excel(writer, sheet_name=args.pred_type)
+            # eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+            # eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
 
         print("Training is done!\n")
     else:
@@ -243,50 +255,52 @@ if __name__=="__main__":
 
         data_loader = DataLoader(tech_dataset, batch_size=args.batch_size)
 
-        trues_recon, trues_y, preds_recon, preds_y = validate_model(final_model, data_loader, model_params)
-        eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type='regression')
-
-    ## TEST: new sample generation from latent vector only
-    data_loader = DataLoader(tech_dataset, batch_size=10)
-    xs, ys = next(iter(data_loader))
-    x = xs[0].unsqueeze(0).to(device)
-    print(f"Generation test\nExample: {token2class(x.tolist(), vocabulary=model_params['vocabulary_rev'])}")
-    o_enc, h_enc = final_model.module.encoder(x)
-    # h_enc = h_enc.view(n_layers, n_directions, batch_size, hidden_dim)
-
-    # Take the last layer hidden vector as latent vector
-    # z = z[-1].view(1, batch_size, -1) # last layer hidden_vector -> (1, batch_size, hidden_dim * n_directions)
-    z = h_enc
-    new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
-    next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
-    for t in range(1, model_params['max_len']):
-        embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
-        gru_input = torch.cat((embedded, z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
-        o_dec, h_dec = final_model.module.decoder.gru(gru_input, z)
-        output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
-        prediction = output.argmax(1)
-
-        next_input = prediction
-        new_outputs[:,:,t] = output
-    new_outputs = new_outputs.argmax(1)
-
-    print(f"Generated output (using the original latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
-
-    # What if adding noise to latent vector?
-    # new_z = z + z.mean().item() * 5e-1
-    new_z = z + torch.rand((z.shape)).to(device) * 1e-4
-    new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
-    next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
-    for t in range(1, model_params['max_len']):
-        embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
-        gru_input = torch.cat((embedded, new_z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
-        o_dec, h_dec = final_model.module.decoder.gru(gru_input, h_enc)
-        output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
-        prediction = output.argmax(1)
-
-        next_input = prediction
-        new_outputs[:,:,t] = output
-    new_outputs = new_outputs.argmax(1)
-
-    print(f"Generated output (using changed latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
+        trues_y, preds_y = validate_model(final_model, data_loader, model_params)
+        # eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
+        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=args.pred_type)
+        if args.pred_type == "classification":
+            eval_y, confmat_y = eval_y
+    #
+    # ## TEST: new sample generation from latent vector only
+    # data_loader = DataLoader(tech_dataset, batch_size=10)
+    # xs, ys = next(iter(data_loader))
+    # x = xs[0].unsqueeze(0).to(device)
+    # print(f"Generation test\nExample: {token2class(x.tolist(), vocabulary=model_params['vocabulary_rev'])}")
+    # o_enc, h_enc = final_model.module.encoder(x)
+    # # h_enc = h_enc.view(n_layers, n_directions, batch_size, hidden_dim)
+    #
+    # # Take the last layer hidden vector as latent vector
+    # # z = z[-1].view(1, batch_size, -1) # last layer hidden_vector -> (1, batch_size, hidden_dim * n_directions)
+    # z = h_enc
+    # new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
+    # next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
+    # for t in range(1, model_params['max_len']):
+    #     embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
+    #     gru_input = torch.cat((embedded, z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
+    #     o_dec, h_dec = final_model.module.decoder.gru(gru_input, z)
+    #     output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
+    #     prediction = output.argmax(1)
+    #
+    #     next_input = prediction
+    #     new_outputs[:,:,t] = output
+    # new_outputs = new_outputs.argmax(1)
+    #
+    # print(f"Generated output (using the original latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
+    #
+    # # What if adding noise to latent vector?
+    # # new_z = z + z.mean().item() * 5e-1
+    # new_z = z + torch.rand((z.shape)).to(device) * 1e-4
+    # new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
+    # next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
+    # for t in range(1, model_params['max_len']):
+    #     embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
+    #     gru_input = torch.cat((embedded, new_z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
+    #     o_dec, h_dec = final_model.module.decoder.gru(gru_input, h_enc)
+    #     output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
+    #     prediction = output.argmax(1)
+    #
+    #     next_input = prediction
+    #     new_outputs[:,:,t] = output
+    # new_outputs = new_outputs.argmax(1)
+    #
+    # print(f"Generated output (using changed latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")

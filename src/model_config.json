@@ -1,0 +1,22 @@
+{
+    "n_enc_vocab": 0,
+    "n_dec_vocab": 0,
+    "n_enc_seq": 512,
+    "n_dec_seq": 512,
+    "n_layers": 12,
+    "d_hidden": 128,
+    "d_embed": 64,
+    "i_start": -1,
+    "i_padding": -2,
+    "i_end": -3,
+    "d_ff": 512,
+    "n_head": 8,
+    "d_head": 64,
+    "dropout": 0.1,
+    "layer_norm_epsilon": 1e-12,
+    "n_outputs": 2,
+    "weight_decay": 0,
+    "learning_rate": 5e-5,
+    "adam_epsilon": 1e-8,
+    "warmup_steps": 0
+}

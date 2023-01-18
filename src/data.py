@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.4
-Description (primary changes): Hyperparameter tuning
+Version: 0.6
+Description (primary changes): Add classification
 '''
 
 # Set root directory
@@ -21,9 +21,18 @@ import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+import torchvision.datasets
 import sklearn
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
+from sklearn.datasets import load_digits
+
+# Text cleaning libraries
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem.porter import PorterStemmer
+import cleantext
+from cleantext.sklearn import CleanTransformer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -34,78 +43,156 @@ TOKEN_PAD = '<PAD>'
 regex = re.compile("[0-9a-zA-Z\/]+")
 
 class TechDataset(Dataset):
-    def __init__(self, device=None, data_dir="", params=None, do_transform=False):
+    def __init__(self, data_dir="", params=None, do_transform=False):
         super().__init__()
         self.tokens = [TOKEN_SOS, TOKEN_EOS, TOKEN_PAD]
-        self.device = device
-        self.data_dir = data_dir
-        if params is not None:
-            self.params = {'target_ipc': 'A61C', 'n_TC': 3, 'ipc_level': 3}
-            self.params.update(params)
-        else:
-            self.params = {'target_ipc': 'A61C', 'n_TC': 3, 'ipc_level': 3}
+
+        for key, value in params.items():
+            setattr(self, key, value)
+
         self.do_transform = do_transform
 
-        self.rawdata = pd.read_csv(os.path.join(data_dir, "collection_final.csv"))
+        if self.data_type in ["class", "claim"]:
+            self.rawdata = pd.read_csv(os.path.join(data_dir, "collection_final_with_claims.csv"))
+            self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess()
+            self.original_idx = np.array(self.data.index)
+            self.X, self.Y = self.make_io()
+        elif self.data_type == "mnist":
+            # self.rawdata = load_digits()
+            self.rawdata = torchvision.datasets.MNIST('data', train=True, download=True)
+            self.data = self.rawdata.data.view(len(self.rawdata.data), -1).numpy()
+            self.X = self.data
+            self.Y = self.rawdata.targets.numpy()
+            n_values = self.X.max() - self.X.min() + 1
+            self.vocab_w2i = {str(x): x for x in range(n_values)}
+            self.vocab_w2i.update({self.tokens[i]: n_values+i for i in range(len(self.tokens))})
+            self.vocab_i2w = {x: str(x) for x in range(n_values)}
+            self.vocab_i2w.update({n_values+i: self.tokens[i] for i in range(len(self.tokens))})
+            self.vocab_size = len(self.vocab_w2i.keys())
 
-        self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess(target_ipc=self.params['target_ipc'], ipc_level=self.params['ipc_level'], n_TC=self.params['n_TC'])
-        self.original_idx = np.array(self.data.index)
-        self.X, self.Y = self.make_io()
+            self.X = np.concatenate([np.tile([self.vocab_w2i[TOKEN_SOS]], (self.X.shape[0],1)), self.X, np.tile([self.vocab_w2i[TOKEN_EOS]], (self.X.shape[0],1))], axis=1)
+            self.seq_len = self.X.shape[-1]
+            self.original_idx = np.arange(len(self.Y))
 
-        self.oversampled_idx = self.resampled_idx = np.array([])
+        self.n_classes = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
 
     def make_io(self, val_main=10, val_sub=1):
         X_df = pd.DataFrame(index=self.data.index)
-        X_df['main'] = self.data['main_ipc'].apply(lambda x: self.vocab_w2i[x])
-        X_df['sub'] = self.data['sub_ipc'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
-        main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
-        X_df['seq'] = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
+        if self.data_type == "class":
+            X_df['main'] = self.data['main_ipc'].apply(lambda x: self.vocab_w2i[x])
+            X_df['sub'] = self.data['sub_ipc'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
+            main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
+            X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
+        elif self.data_type == "claim":
+            tokened_claims = self.data['claims'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
+            X = tokened_claims.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
 
-        X = np.vstack(X_df['seq'].values)
-        Y = self.data['TC'+str(self.params['n_TC'])].values
+        # X = pd.concat(X)
+        # Y = self.data['TC'+str(self.n_TC)]
+        # if self.pred_type == "classification":
+        #     new_Y = np.zeros_like(Y.values).astype(int)
+        #     new_Y[Y>0] = 1
+        #     Y = pd.
+        X = np.vstack(X.values)
+        Y = self.data['TC'+str(self.n_TC)].values
+        if self.pred_type == "classification":
+            new_Y = np.zeros_like(Y).astype(int)
+            new_Y[Y>0] = 1
+            # new_Y[np.random.choice(np.arange(len(Y)), int(len(Y)/3)*2, replace=False)] = 1
+            # print(int(len(Y)/2), new_Y.sum())
+            Y = new_Y
+            # Y_str = self.rawdata.set_index('number').loc[self.data.index]['main ipc'].apply(lambda x: str(x)[:4])
+            # classes = list(np.unique(Y_str))
+            # Y = Y_str.apply(lambda x: classes.index(x)).values
 
         return X, Y
 
     def transform(self, sample):
         main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
         X = np.concatenate([main_sub_combined, np.zeros(self.seq_len-(len(main_sub_combined)-2))+self.vocab_w2i[TOKEN_PAD]])
-        Y = sample['TC'+str(self.params['n_TC'])]
+        Y = sample['TC'+str(self.n_TC)]
         return X, Y
 
-    def preprocess(self, target_ipc='A61C', ipc_level=3, n_TC=3):
+    def preprocess(self):
         cols_year = ['<1976']+list(np.arange(1976,2018).astype(str))
 
-        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc', 'sub ipc'])[['number','main ipc','sub ipc']]
-        main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if target_ipc in x]
-        rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+        if self.data_type == "class":
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','sub ipc'])[['number','main ipc','sub ipc']]
+            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+            data = rawdata_ipc[['number']].copy(deep=True)
+            assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
+            if self.ipc_level == 1:
+                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0][:3])
+                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0][:3] for xx in x.split(';')])
+            elif self.ipc_level == 2:
+                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0])
+                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0] for xx in x.split(';')])
+            elif self.ipc_level == 3:
+                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: "".join(regex.findall(x)))
+                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: ["".join(regex.findall(xx)) for xx in x.split(';')])
+            seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
+        elif self.data_type == "claim":
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','claims']]
+            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+            cleaned_claims = self.text_cleaning(text_list=rawdata_ipc['claims'], claim_level=self.claim_level)
+            data = pd.concat([rawdata_ipc[['number']], cleaned_claims.rename('claims')], axis=1)
+            seq_len = data['claims'].apply(lambda x: len(x)).max() + 3
+
         rawdata_tc = self.rawdata.loc[rawdata_ipc.index][['year']+cols_year]
-
-        data = rawdata_ipc[['number']].copy(deep=True)
-        assert ipc_level in [1,2,3], f"Not implemented for an IPC level {ipc_level}"
-        if ipc_level == 1:
-            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0][:3])
-            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0][:3] for xx in x.split(';')])
-        elif ipc_level == 2:
-            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0])
-            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0] for xx in x.split(';')])
-        elif ipc_level == 3:
-            data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: "".join(regex.findall(x)))
-            data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: ["".join(regex.findall(xx)) for xx in x.split(';')])
-        data['TC'+str(n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year']+1 if x['year']<2017 else 2017, x['year']+n_TC+1 if x['year']+n_TC<2018 else 2018).astype(str)].sum(), axis=1)
+        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year']+1 if x['year']<2017 else 2017, x['year']+self.n_TC+1 if x['year']+self.n_TC<2018 else 2018).astype(str)].sum(), axis=1)
         data = data.set_index('number')
-        seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
 
-        main_ipcs = list(np.unique(data['main_ipc']))
-        sub_ipcs = list(np.unique(np.concatenate(list(data['sub_ipc'].values))))
-        all_ipcs = list(np.union1d(main_ipcs, sub_ipcs))
+        if self.data_type == "class":
+            main_ipcs = list(np.unique(data['main_ipc']))
+            sub_ipcs = list(np.unique(np.concatenate(list(data['sub_ipc'].values))))
+            all_items = list(np.union1d(main_ipcs, sub_ipcs))
+        elif self.data_type == "claim":
+            all_items = list(np.unique(np.concatenate(data['claims'].values)))
 
-        vocab_w2i = {all_ipcs[i]: i for i in range(len(all_ipcs))}
-        vocab_w2i.update({self.tokens[i]: len(all_ipcs)+i for i in range(len(self.tokens))})
-        vocab_i2w = {i: all_ipcs[i] for i in range(len(all_ipcs))}
-        vocab_i2w.update({len(all_ipcs)+i: self.tokens[i] for i in range(len(self.tokens))})
+        vocab_w2i = {all_items[i]: i for i in range(len(all_items))}
+        vocab_w2i.update({self.tokens[i]: len(all_items)+i for i in range(len(self.tokens))})
+        vocab_i2w = {i: all_items[i] for i in range(len(all_items))}
+        vocab_i2w.update({len(all_items)+i: self.tokens[i] for i in range(len(self.tokens))})
         vocab_size = len(vocab_w2i)
 
         return (data, vocab_w2i, vocab_i2w, vocab_size, seq_len)
+
+    def text_cleaning(self, text_list=None, claim_level=1, claim_separator="\n\n\n"):
+        if not isinstance(text_list, pd.core.series.Series): text_list = pd.Series(text_list)
+
+        basic_cleaner = CleanTransformer(
+                        lower=True, no_line_breaks=True, normalize_whitespace=True,
+                        no_punct=True, strip_lines=True,
+                        no_currency_symbols=True, replace_with_currency_symbol="",
+                        no_numbers=True, replace_with_number="",
+                        no_digits=True, replace_with_digit="")
+        stop_words = stopwords.words("english")
+        stemmer = PorterStemmer()
+
+        # Take the first claim
+        if claim_level == -1:
+            cleaned = text_list
+        else:
+            cleaned = text_list.apply(lambda x: "".join(x.split(claim_separator)[:claim_level]) if len(x.split(claim_separator))>=claim_level else x)
+        # Basic text cleaning
+        cleaned = basic_cleaner.transform(cleaned)
+        # Remove stopwords
+        cleaned = cleaned.apply(lambda claim: np.array([word for word in claim.split() if word not in stop_words]))
+        # Stemming
+        cleaned = cleaned.apply(lambda claim: [stemmer.stem(word) for word in claim])
+        # Remove duplicates and sorting
+        cleaned = cleaned.apply(lambda claim: list(np.array(claim)[np.sort(np.unique(claim, return_index=True)[1])]))
+        # Remove too frequent or too rare words
+        vocab, vocab_counts = np.unique(np.concatenate(cleaned.values), return_counts=True)
+        freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.4))[0]] # frequent words: words that appear more than 40% of the data samples
+        # rare_words = vocab[np.where(vocab_counts<3)[0]] # rare words: words that appear less than 2 times
+        rare_words = vocab[np.where(vocab_counts<int(len(cleaned)*0.01))[0]] # rare words: words that appear less than 0.1% of the data samples
+        print(f"FREQ: {freq_words} ({len(freq_words)}), RARE: {rare_words} ({len(rare_words)})")
+        cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
+
+        return cleaned
 
     def __len__(self):
         return len(self.data)
@@ -120,16 +207,9 @@ class TechDataset(Dataset):
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify
-        self.oversampled = oversampled
+        # self.oversampled = oversampled
         self.labels = dataset.Y
-        if self.oversampled:
-            self.oversampled_idx = np.intersect1d(dataset.oversampled_idx, dataset.resampled_idx)
-            self.original_idx = np.intersect1d(dataset.original_idx, dataset.resampled_idx)
-            # self.labels_org = self.labels.loc[self.original_idx]
-        else:
-            self.original_idx = dataset.original_idx
-            self.oversampled_idx = dataset.oversampled_idx
-
+        self.original_idx = dataset.original_idx
         self.dataset = dataset
         self.test_ratio = test_ratio
         self.val_ratio = val_ratio
@@ -141,32 +221,29 @@ class CVSampler:
 
     def split(self):
         if self.stratify:
-            splitter = StratifiedShuffleSplit(n_splits=1, test_size=self.test_ratio, random_state=self.random_state)
-            for train_idx, test_idx in splitter.split(np.zeros(len(self.labels)), self.labels):
-                self.train_samples_idx = np.random.permutation(np.union1d(self.original_idx[train_idx], self.oversampled_idx))
-                self.test_samples_idx = self.original_idx[test_idx]
-            if self.n_folds == 1:
-                self.idx_dict[0] = {'train': self.train_samples_idx, 'test': self.test_samples_idx}
-            else:
-                kf_splitter = StratifiedKFold(n_splits=self.n_folds, random_state=self.random_state, shuffle=True)
-                fold = 0
-                for train_idx, val_idx in kf_splitter.split(np.zeros(len(self.train_samples_idx)), self.labels[self.train_samples_idx]):
-                    self.idx_dict[fold] = {'train': self.train_samples_idx[train_idx], 'val': self.train_samples_idx[val_idx], 'test': self.test_samples_idx}
-                    fold += 1
+            test_splitter = StratifiedShuffleSplit(n_splits=1, test_size=self.test_ratio, random_state=self.random_state)
+            whole_train_idx, test_idx = next(iter(test_splitter.split(np.zeros(len(self.labels)), self.labels)))
+            val_splitter = StratifiedShuffleSplit(n_splits=1, test_size=self.val_ratio, random_state=self.random_state)
+            train_idx, val_idx = next(iter(val_splitter.split(np.zeros(len(whole_train_idx)), self.labels[whole_train_idx])))
         else:
-            splitter = ShuffleSplit(n_splits=1, test_size=self.test_ratio, random_state=self.random_state)
-            for train_idx, test_idx in splitter.split(np.zeros(len(self.dataset.data))):
-                self.train_samples_idx = train_idx
-                self.val_index = int(len(train_idx)*(1-self.val_ratio))
-                self.test_samples_idx = test_idx
-            if self.n_folds == 1:
-                self.idx_dict[0] = {'train': self.train_samples_idx[:self.val_index], 'val': self.train_samples_idx[self.val_index:], 'test': self.test_samples_idx}
+            test_splitter = ShuffleSplit(n_splits=1, test_size=self.test_ratio, random_state=self.random_state)
+            whole_train_idx, test_idx = next(iter(test_splitter.split(np.zeros(len(self.labels)), self.labels)))
+            val_splitter = ShuffleSplit(n_splits=1, test_size=self.val_ratio, random_state=self.random_state)
+            train_idx, val_idx = next(iter(val_splitter.split(np.zeros(len(whole_train_idx)), self.labels[whole_train_idx])))
+
+        self.train_samples_idx = whole_train_idx[train_idx]
+        self.val_samples_idx = whole_train_idx[val_idx]
+        self.test_samples_idx = test_idx
+
+        if self.n_folds == 1:
+            self.idx_dict[0] = {'train': self.train_samples_idx, 'val': self.val_samples_idx, 'test': self.test_samples_idx}
+        else:
+            if self.stratify:
+                kf_splitter = StratifiedKFold(n_splits=self.n_folds, random_state=self.random_state, shuffle=True)
             else:
                 kf_splitter = KFold(n_splits=self.n_folds, random_state=self.random_state, shuffle=True)
-                fold = 0
-                for train_idx, val_idx in kf_splitter.split(np.zeros(len(self.train_samples_idx)), self.labels[self.train_samples_idx]):
-                    self.idx_dict[fold] = {'train': self.train_samples_idx[train_idx], 'val': self.train_samples_idx[val_idx], 'test': self.test_samples_idx}
-                    fold += 1
+            for fold, (train_idx, val_idx) in enumerate(kf_splitter.split(np.zeros(len(whole_train_idx)), self.labels[whole_train_idx])):
+                self.idx_dict[fold] = {'train': whole_train_idx[train_idx], 'val': whole_train_idx[val_idx], 'test': self.test_samples_idx}
 
     def get_idx_dict(self):
         return self.idx_dict
