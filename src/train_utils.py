@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.4
-Description (primary changes): Add functions for hyperparameter tuning
+Version: 0.41
+Description (primary changes): Add PyTorch profiler
 '''
 
 # Set root directory
@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from torch.profiler import profile, record_function, ProfilerActivity
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score
 
 from data import TechDataset, CVSampler
@@ -33,6 +34,7 @@ from data import TechDataset, CVSampler
 from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+profiler_activity = ProfilerActivity.CUDA if device is torch.device('cuda') else ProfilerActivity.CPU
 
 class EarlyStopping:
     """주어진 patience 이후로 validation loss가 개선되지 않으면 학습을 조기 중지"""
@@ -91,41 +93,20 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
     loss_weights['y'] = 1 - loss_weights['recon']
 
     loss_out = {'total': [], 'recon': [], 'y': []}
-    # batch_losses = []
-    if mode == 'train':
-        model.train()
-        for batch, (X, Y) in enumerate(dataloader):
-            X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.float) # X: (batch_size, seq_len)
-            preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
-            trues_recon = X.clone()
-            trues_y = Y.clone()
 
-            batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
-            batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
-            batch_loss_total = sum([batch_loss_recon, batch_loss_y])
+    use_cuda = True if device is torch.device('cuda') else False
+    with profile(activities=[profiler_activity], record_shapes=True, profile_memory=True, use_cuda=use_cuda) as prof:
+        if mode == 'train':
+        # with record_function("training_phase"):
+            model.train()
+            for batch, (X, Y) in enumerate(dataloader):
+                X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.float) # X: (batch_size, seq_len)
+                with record_function("training_phase"):
+                    preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
+                trues_recon = X
+                trues_y = Y
 
-            loss_out['recon'].append(batch_loss_recon.item())
-            loss_out['y'].append(batch_loss_y.item())
-            loss_out['total'].append(batch_loss_total.item())
-
-            optimizer.zero_grad()
-            # batch_loss_total.sum().backward()
-            batch_loss_total.backward()
-            optimizer.step()
-
-            if batch % 10 == 0 or batch == len(dataloader)-1:
-                loss, current = batch_loss_total.item(), batch*len(X)
-                if batch == len(dataloader)-1:
-                    current = size
-                print(f"loss: {loss:>7f} [{current:>5d}/{size:>5d}]", end='\r', flush=True)
-    else:
-        model.eval()
-        with torch.no_grad():
-            for X, Y in dataloader:
-                X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
-                preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
-                trues_recon = X.clone()
-                trues_y = Y.clone()
+                batch_len = len(X)
 
                 batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
                 batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
@@ -134,6 +115,44 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
                 loss_out['recon'].append(batch_loss_recon.item())
                 loss_out['y'].append(batch_loss_y.item())
                 loss_out['total'].append(batch_loss_total.item())
+
+                if device == torch.device('cuda'):
+                    print(f"Before - Allocated mem: {np.round(torch.cuda.memory_allocated()*1e-6, 2}Mb, Cache mem: {np.round(torch.cuda.memory_reserved()*1e-6, 2}Mb")
+                    del X
+                    del Y
+                    del preds_recon
+                    del preds_y
+                    torch.cuda.empty_cache()
+                    print(f"After - Allocated mem: {np.round(torch.cuda.memory_allocated()*1e-6, 2}Mb, Cache mem: {np.round(torch.cuda.memory_reserved()*1e-6, 2}Mb\n")
+
+                optimizer.zero_grad()
+                # batch_loss_total.sum().backward()
+                batch_loss_total.backward()
+                optimizer.step()
+
+                if batch % 10 == 0 or batch == len(dataloader)-1:
+                    loss, current = batch_loss_total.item(), batch*batch_len
+                    if batch == len(dataloader)-1:
+                        current = size
+                    print(f"loss: {loss:>7f} [{current:>5d}/{size:>5d}]", end='\r', flush=True)
+        else:
+            # with record_function("validation_phase"):
+            model.eval()
+            with torch.no_grad():
+                for X, Y in dataloader:
+                    X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
+                    with record_function("validation_phase"):
+                        preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
+                    trues_recon = X
+                    trues_y = Y
+
+                    batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
+                    batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
+                    batch_loss_total = sum([batch_loss_recon, batch_loss_y])
+
+                    loss_out['recon'].append(batch_loss_recon.item())
+                    loss_out['y'].append(batch_loss_y.item())
+                    loss_out['total'].append(batch_loss_total.item())
 
     # return np.average(batch_losses)
     loss_out = {l: np.mean(loss_out[l]) for l in loss_out.keys()}
