@@ -23,10 +23,6 @@ from torch.nn import functional as F
 from torch.autograd import Variable
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 
-TOKEN_SOS = '<SOS>'
-TOKEN_EOS = '<EOS>'
-TOKEN_PAD = '<PAD>'
-
 ## weight initialization
 def init_weights(m):
     if not isinstance(m, nn.Module): return
@@ -74,7 +70,7 @@ class ScaledDotProductAttention(nn.Module):
         super().__init__()
         self.config = config
         self.device = self.config.device
-        self.dropout = nn.Dropout(self.config.dropout)
+        self.dropout = nn.Dropout(self.config.p_dropout)
         self.scale = 1 / (self.config.d_head ** 0.5)
 
     def forward(self, Q, K, V, attn_mask):
@@ -102,7 +98,7 @@ class MultiHeadAttention(nn.Module):
         self.W_V = nn.Linear(self.config.d_hidden, self.config.n_head * self.config.d_head).to(self.device)
         self.scaled_dot_attn = ScaledDotProductAttention(self.config)
         self.linear = nn.Linear(self.config.n_head*self.config.d_head, self.config.d_hidden).to(self.device)
-        self.dropout = nn.Dropout(self.config.dropout).to(self.device)
+        self.dropout = nn.Dropout(self.config.p_dropout).to(self.device)
 
     def forward(self, X_Q, X_K, X_V, attn_mask):
         # X_Q: (batch_size, n_q_seq, d_hidden), X_K: (batch_size, n_k_seq, d_hidden), X_V: (batch_size, n_v_seq, d_hidden), attn_mask: (batch_size, n_enc_seq, n_enc_seq)
@@ -132,7 +128,7 @@ class PoswiseFeedForwardNet(nn.Module):
         self.conv1 = nn.Conv1d(in_channels=self.config.d_hidden, out_channels=self.config.d_ff, kernel_size=1).to(self.device)
         self.conv2 = nn.Conv1d(in_channels=self.config.d_ff, out_channels=self.config.d_hidden, kernel_size=1).to(self.device)
         self.activation = F.relu
-        self.dropout = nn.Dropout(self.config.dropout).to(self.device)
+        self.dropout = nn.Dropout(self.config.p_dropout).to(self.device)
 
     def forward(self, inputs):
         # inputs: (batch_size, n_seq, d_hidden)

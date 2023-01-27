@@ -14,6 +14,7 @@ import os
 import copy
 import functools
 import operator
+import time
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -26,24 +27,14 @@ from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score
 
 from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
+# from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
+from models import Transformer
 from utils import token2class
-
-from data import TechDataset, CVSampler
-from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class EarlyStopping:
-    """주어진 patience 이후로 validation loss가 개선되지 않으면 학습을 조기 중지"""
     def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt'):
-        """
-        Args:
-            patience (int): validation loss가 개선된 후 기다리는 기간
-            verbose (bool): True일 경우 각 validation loss의 개선 사항 메세지 출력
-            delta (float): 개선되었다고 인정되는 monitered quantity의 최소 변화
-            path (str): checkpoint저장 경로
-        """
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -77,7 +68,6 @@ class EarlyStopping:
         return model
 
     def save_checkpoint(self, val_loss, model):
-        '''validation loss가 감소하면 모델을 저장한다.'''
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
         torch.save(model.state_dict(), self.path)
@@ -94,6 +84,7 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
     # batch_losses = []
     if mode == 'train':
         model.train()
+
         for batch, (X, Y) in enumerate(dataloader):
             X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.float) # X: (batch_size, seq_len)
             preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
@@ -139,31 +130,90 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
     loss_out = {l: np.mean(loss_out[l]) for l in loss_out.keys()}
     return loss_out
 
+def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train', device='cpu'):
+    clip_max_norm = 1
+    if mode=="train":
+        model.train()
+        epoch_loss = 0
+
+        for i, (X, Y) in enumerate(data_loader):
+            src, trg, y = X.to(device), X.to(device), Y.to(device)
+
+            optimizer.zero_grad()
+
+            pred_trg, *_ = model(src, trg[:,:-1]) # omit <eos> from target sequence
+            # output: (batch_size, n_dec_seq-1, n_dec_vocab)
+            output_dim = pred_trg.shape[-1]
+            pred_trg = pred_trg.contiguous().view(-1, output_dim) # output: (batch_size * (n_dec_seq-1))
+            true_trg = trg[:,1:].contiguous().view(-1) # omit <sos> from target sequence
+
+            loss = loss_f(pred_trg, true_trg)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        return epoch_loss / len(data_loader)
+    elif mode=="eval" or mode=="test":
+        model.eval()
+        epoch_loss = 0
+
+        for i, (X, Y) in enumerate(data_loader):
+            src, trg = X.to(device), X.to(device)
+            y = Y.to(device)
+
+            pred_trg, *_ = model(src, trg[:,:-1]) # omit <eos> from target sequence
+            # output: (batch_size, n_dec_seq-1, n_dec_vocab)
+            output_dim = pred_trg.shape[-1]
+            pred_trg = pred_trg.contiguous().view(-1, output_dim) # output: (batch_size * (n_dec_seq-1))
+            true_trg = trg[:,1:].contiguous().view(-1) # omit <sos> from target sequence
+
+            loss = loss_f(pred_trg, true_trg)
+
+            epoch_loss += loss.item()
+
+        return epoch_loss / len(data_loader)
+
+    else:
+        print("mode is not specified")
+        return
+
 def build_model(model_params={}, trial=None):
     device = model_params['device']
     device_ids = model_params['device_ids']
 
     if trial is not None:
         model_params['n_layers'] = trial.suggest_int("n_layers", 1, 3)
-        model_params['embedding_dim'] = trial.suggest_categorical("embedding_dim", [32, 64, 128, 256])
-        model_params['hidden_dim'] = trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512])
-        model_params['latent_dim'] = trial.suggest_int("latent_dim", model_params['hidden_dim'] * model_params['n_layers'] * model_params['n_directions'], model_params['hidden_dim'] * model_params['n_layers'] * model_params['n_directions'])
+        model_params['d_embedding'] = trial.suggest_categorical("d_embedding", [32, 64, 128, 256])
+        model_params['d_hidden'] = trial.suggest_categorical("d_hidden", [32, 64, 128, 256, 512])
+        model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'], model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'])
 
     ## Construct networks
-    enc = Encoder_SEQ(params=model_params).to(device=device, dtype=torch.float)
-    att = Attention(params=model_params).to(device=device, dtype=torch.float)
-    dec = AttnDecoder_SEQ(attention=att, params=model_params).to(device=device, dtype=torch.float)
-    pred = Predictor(params=model_params).to(device=device, dtype=torch.float)
-    model = SEQ2SEQ(device=device, enc=enc, dec=dec, pred=pred, vocab=model_params['vocabulary'], max_len=model_params['max_len']).to(device=device, dtype=torch.float)
-    model = torch.nn.DataParallel(model, device_ids=device_ids)
+    # enc = Encoder_SEQ(params=model_params).to(device=device, dtype=torch.float)
+    # att = Attention(params=model_params).to(device=device, dtype=torch.float)
+    # dec = AttnDecoder_SEQ(attention=att, params=model_params).to(device=device, dtype=torch.float)
+    # pred = Predictor(params=model_params).to(device=device, dtype=torch.float)
+    # model = SEQ2SEQ(device=device, enc=enc, dec=dec, pred=pred, vocab=model_params['vocabulary'], max_len=model_params['max_len']).to(device=device, dtype=torch.float)
+    # model = torch.nn.DataParallel(model, device_ids=device_ids)
+
+    model = Transformer(model_params)
+    if len(device_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     return model
+
+def epoch_time(start, end):
+    elapsed_time = end - start
+    elapsed_mins = int(elapsed_time / 60)
+    elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
+    return elapsed_mins, elapsed_secs
 
 def train_model(model, train_loader, val_loader, model_params={}, train_params={}, trial=None):
     device = model_params['device']
 
     ## Loss function and optimizers
-    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['padding_idx'])
+    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_pad'])
     loss_y = torch.nn.MSELoss()
 
     if trial is not None:
@@ -175,16 +225,24 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         max_epochs = train_params['max_epochs']
         early_stop_patience = train_params['early_stop_patience']
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_params['learning_rate'])
+    optimizer = torch.optim.AdamW(model.parameters(), lr=train_params['learning_rate'])
 
     ## Training
     if train_params['use_early_stopping']:
         early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'],"models/ES_checkpoint_"+train_params['train_param_name']+".ckpt"))
+
     for ep in range(max_epochs):
+        epoch_start = time.time()
         print(f"Epoch {ep+1}\n"+str("-"*25))
-        train_loss = run_epoch(train_loader, model, loss_recon, loss_y, mode='train', optimizer=optimizer, loss_weights=train_params['loss_weights'], device=device)
-        val_loss = run_epoch(val_loader, model, loss_recon, loss_y, mode='test', loss_weights=train_params['loss_weights'], device=device)
-        print(f"Avg train loss: {train_loss['total']:>5f}, Avg val loss: {val_loss['total']:>5f}\n")
+        # train_loss = run_epoch(train_loader, model, loss_recon, loss_y, mode='train', optimizer=optimizer, loss_weights=train_params['loss_weights'], device=device)
+        # val_loss = run_epoch(val_loader, model, loss_recon, loss_y, mode='test', loss_weights=train_params['loss_weights'], device=device)
+        train_loss = run_epoch_temp(train_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='train', device=device)
+        val_loss = run_epoch_temp(val_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='eval', device=device)
+        epoch_end = time.time()
+        epoch_mins, epoch_secs = epoch_time(epoch_start, epoch_end)
+        print(f'Epoch: {ep + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
+        # print(f"Avg train loss: {train_loss['total']:>5f}, Avg val loss: {val_loss['total']:>5f}\n")
+        print(f"Avg train loss: {train_loss:>5f}, Avg val loss: {val_loss:>5f}\n")
 
         if train_params['use_early_stopping']:
             model = early_stopping(val_loss['total'], model)

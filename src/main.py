@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.6
-Description (primary changes): Add classification
+Version: 0.61
+Description (primary changes): Configuration through .json; instant configuration input through argument parsing
 '''
 
 # Set root directory
@@ -16,6 +16,7 @@ import os
 import argparse
 import math
 import time
+import pickle
 import warnings
 warnings.filterwarnings(action='ignore', category=UserWarning)
 warnings.filterwarnings(action='ignore', category=DeprecationWarning)
@@ -44,144 +45,127 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from models import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor, EncPred
+from models import Transformer
 from train_utils import run_epoch, EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model
-from utils import token2class
-
-TOKEN_SOS = '<SOS>'
-TOKEN_EOS = '<EOS>'
-TOKEN_PAD = '<PAD>'
+from utils import token2class, DotDict
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data_type', default='class', help="Type of input data. class / claim")
-parser.add_argument('--pred_type', default='regression', help="Type of prediction. regression/classification")
-parser.add_argument('--train', default=False, action='store_true')
-parser.add_argument('--tune', default=False, action='store_true')
-parser.add_argument('--n_trials', default=2, type=int)
-parser.add_argument('--n_folds', default=1, type=int)
-parser.add_argument('--learning_rate', default=5e-3, type=float)
-parser.add_argument('--batch_size', default=16, type=int)
-parser.add_argument('--max_epochs', default=2, type=int)
-parser.add_argument('--n_gpus', default=4, type=int)
-parser.add_argument('--embedding_dim', default=32, type=int)
-parser.add_argument('--hidden_dim', default=32, type=int)
-parser.add_argument('--n_layers', default=1, type=int)
-parser.add_argument('--no_early_stopping', dest='no_early_stopping', action='store_true')
-parser.add_argument('--target_ipc', default='A23L', type=str)
-parser.add_argument('--ipc_level', default=3, type=int, help="IPC level. 1: Section-Class, 2: Section-Class-Sub Class, 3: Section-Class-Sub Class-Group(main or sub)")
-parser.add_argument('--claim_level', default=1, type=int, help="Claim level. 1: First claim, 2: Second claim, ..., -1: Use all claims")
-parser.add_argument('--n_TC', default=3, type=int, help="number of years for counting the number of forward citations of patent")
-parser.add_argument('--bidirec', default=False, action='store_true')
+parser.add_argument("--data_type", type=str)
+parser.add_argument("--target_ipc", type=str)
+parser.add_argument("--pred_type", type=str)
+parser.add_argument("--do_train", default=None, action="store_true")
+parser.add_argument("--do_tune", default=None, action="store_true")
+parser.add_argument("--n_folds", type=int)
+parser.add_argument("--max_epochs", type=int)
 
 if __name__=="__main__":
-    args = parser.parse_args()
+    ''' PART 1: Configuration '''
+    configs = DotDict().load("configs.json")
+    org_config_keys = {key: list(configs[key].keys()) for key in configs.keys()}
 
-    data_dir = os.path.join(root_dir, 'data')
+    data_dir = os.path.join(root_dir, "data")
+    model_dir = os.path.join(root_dir, "models")
 
     if torch.cuda.is_available():
-        device = torch.device('cuda')
         device_ids = list(range(torch.cuda.device_count()))
-        device_ids = np.argsort(list(map(torch.cuda.memory_allocated, device_ids)))[:args.n_gpus]
+        device_ids = np.argsort(list(map(torch.cuda.memory_allocated, device_ids)))[::-1][:configs.train.n_gpus]
         device_ids = list(map(lambda x: torch.device('cuda', x),list(device_ids)))
+        device = device_ids[0] # main device
     else:
         device = torch.device('cpu')
         device_ids = []
 
-    ## Set hyperparameters for model training (FIXED)
-    bidirec = args.bidirec
-    n_directions = 2 if bidirec else 1
-    output_dim_predictor = 1 if args.pred_type=="regression" else 2
-    # output_dim_predictor = 1
-    n_folds = args.n_folds
-    max_epochs = args.max_epochs
-    drop_prob = 0.5
-    loss_weights = {'recon': 2, 'y': 8}
-    model_path = os.path.join(root_dir, "models")
+    configs.data.update({"root_dir": root_dir,
+                            "data_dir": data_dir,
+                            "model_dir": model_dir})
+    configs.model.update({"device": device,
+                            "device_ids": device_ids,
+                            "n_directions": 2 if configs.model.bidirec else 1,
+                            "n_outputs": 1 if configs.data.pred_type=="regression" else 2})
+    configs.train.update({"root_dir": root_dir,
+                            "data_dir": data_dir,
+                            "model_dir": model_dir,
+                            "early_stop_patience": int(0.3*configs.train.max_epochs)})
 
     ## Set hyperparameters for model training (To be TUNED)
-    if args.train and args.tune:
-        n_layers = args.n_layers = None
-        embedding_dim = args.embedding_dim = None
-        hidden_dim = args.hidden_dim = None
-        latent_dim = None
-        learning_rate = args.learning_rate = None
-        batch_size = args.batch_size = None
-
-        train_param_name = "HPARAM_TUNING"
+    if configs.train.do_train and configs.train.do_tune:
+        n_layers = configs.model.n_layers = None
+        d_embedding = configs.model.d_embedding = None
+        d_hidden = configs.model.d_hidden = None
+        d_latent = None
+        learning_rate = configs.train.learning_rate = None
+        batch_size = configs.train.batch_size = None
+        config_name = "HPARAM_TUNING"
         final_model_path = None
     else:
-        n_layers = args.n_layers
-        embedding_dim = args.embedding_dim
-        hidden_dim = args.hidden_dim
-        latent_dim = hidden_dim*n_layers*n_directions
-        learning_rate = args.learning_rate
-        batch_size = args.batch_size
+        n_layers = configs.model.n_layers
+        d_embedding = configs.model.d_embedding
+        d_hidden = configs.model.d_hidden
+        d_latent = configs.model.n_layers * configs.model.d_hidden * configs.model.n_directions
+        config_name = f"{n_layers}layers_{d_embedding}emb_{d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate,4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
+        final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
-        train_param_name = f"{n_layers}layers_{embedding_dim}emb_{hidden_dim}hid_{n_directions}direc_{np.round(learning_rate,4)}lr_{batch_size}batch_{max_epochs}ep"
-        final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
+    configs.model.update({"d_latent": d_latent})
+    configs.train.update({"config_name": config_name,
+                            "final_model_path": final_model_path})
 
-    use_early_stopping = False if args.no_early_stopping else True
-    if use_early_stopping: early_stop_patience = int(0.3*max_epochs)
+    args = parser.parse_args()
+    instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
+    instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
+    for key, value in configs.items():
+        value.update(instant_configs_for_update[key])
 
-    train_params = copy.deepcopy(vars(args))
-    train_params.pop('train') # To avoid conflict
-    train_params.update({'root_dir': root_dir,
-                         'loss_weights': loss_weights,
-                         'use_early_stopping': use_early_stopping,
-                         'early_stop_patience': early_stop_patience,
-                         'train_param_name': train_param_name,
-                         'model_path': model_path,
-                         'max_epochs_for_tune': 25,
-                         'early_stop_patience_for_tune': 10})
-    model_params = copy.deepcopy(vars(args))
-    model_params.pop('train') # To avoid conflict
-    model_params.update({'device': device,
-                         'device_ids': device_ids,
-                         'n_directions': n_directions,
-                         'latent_dim': latent_dim,
-                         'drop_prob': drop_prob})
-
-    # Sampling for cross validation
+    ''' PART 2: Dataset setting '''
     print("Load dataset...")
     tstart = time.time()
-    tech_dataset = TechDataset(data_dir=data_dir, do_transform=False, params=train_params)
+    dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys["data"]])
+    dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
+    if os.path.exists(dataset_path):
+        with open(dataset_path, "rb") as f:
+            tech_dataset = pickle.load(f)   # Load pickled dataset if dataset with same configuration already saved
+        print("Pickled dataset loaded")
+    else:
+        tech_dataset = TechDataset(configs.data)
+        with open(dataset_path, "wb") as f:
+            pickle.dump(tech_dataset, f)
     tend = time.time()
-    print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{train_params['target_ipc']}]")
+    print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
-    model_params.update({'vocabulary': tech_dataset.vocab_w2i,
-                         'vocabulary_rev': tech_dataset.vocab_i2w,
-                         'padding_idx': tech_dataset.vocab_w2i[TOKEN_PAD],
-                         'vocab_size': tech_dataset.vocab_size,
-                         'max_len': tech_dataset.seq_len,
-                         'output_dim_predictor': tech_dataset.n_classes})
+    configs.model.__dict__.update({"vocabulary": tech_dataset.vocab_w2i,
+                            "vocabulary_rev": tech_dataset.vocab_i2w,
+                            "n_enc_vocab": tech_dataset.vocab_size,
+                            "n_dec_vocab": tech_dataset.vocab_size,
+                            "n_enc_seq": tech_dataset.seq_len,
+                            "n_dec_seq": tech_dataset.seq_len,
+                            "i_pad": tech_dataset.vocab_w2i["<PAD>"]})
 
-    if args.train:
-        sampler = CVSampler(tech_dataset, n_folds=n_folds, test_ratio=0.3, stratify=True)
+    ''' PART 3: Training '''
+    if configs.train.do_train:
+        sampler = CVSampler(tech_dataset, n_folds=configs.train.n_folds, test_ratio=0.3, stratify=True)
         cv_idx = sampler.get_idx_dict()
         print(f"#Samples\nTrain: {len(cv_idx[0]['train'])}, Validation: {len(cv_idx[0]['val'])}, Test: {len(cv_idx[0]['test'])}")
 
-        if args.tune:
-            optuna_obj = lambda trial: objective_cv(trial, dataset=tech_dataset, cv_idx=cv_idx, model_params=model_params, train_params=train_params)
+        ''' PART 3-1: Hyperparmeter tuning '''
+        if configs.train.do_tune:
+            optuna_obj = lambda trial: objective_cv(trial, dataset=tech_dataset, cv_idx=cv_idx, model_params=configs.model, train_params=configs.train)
 
-            # opt_sampler = SkoptSampler(
-            #     skopt_kwargs={'n_random_starts': 5,
-            #                   'acq_func': 'EI',
-            #                   'acq_func_kwargs': {'xi': 0.02}})
-            # opt_sampler = RandomSampler()
             opt_sampler = TPESampler()
             study = optuna.create_study(direction='minimize')
-            study.optimize(optuna_obj, n_trials=args.n_trials, gc_after_trial=True)
+            study.optimize(optuna_obj, n_trials=configs.train.n_trials, gc_after_trial=True)
             best_params = study.best_trial.params
 
             print(f"Best trial:\n  MSE: {study.best_trial.value}\n  Params:")
             for k, v in best_params.items():
                 print(f"    {k}: {v}")
 
-            train_params.update({k: v for k,v in best_params.items() if k in train_params.keys()})
-            model_params.update({k: v for k,v in best_params.items() if k in model_params.keys()})
+            configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
+            confgis.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
+            #
+            # train_param_name = f"{model_params['n_layers']}layers_{model_params['embedding_dim']}emb_{model_params['hidden_dim']}hid_{model_params['n_directions']}direc_{np.round(train_params['learning_rate'],4)}lr_{configs.train.batch_size}batch_{train_params['max_epochs']}ep"
+            # final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
 
-            train_param_name = f"{model_params['n_layers']}layers_{model_params['embedding_dim']}emb_{model_params['hidden_dim']}hid_{model_params['n_directions']}direc_{np.round(train_params['learning_rate'],4)}lr_{train_params['batch_size']}batch_{train_params['max_epochs']}ep"
-            final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
+            config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
+            final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
         ## Construct datasets
         train_idx = cv_idx[0]['train']
@@ -194,17 +178,17 @@ if __name__=="__main__":
         test_dataset = Subset(tech_dataset, test_idx)
         whole_dataset = Subset(tech_dataset, whole_idx)
 
-        train_loader = DataLoader(train_dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=4, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=train_params['batch_size'], shuffle=True, num_workers=4, drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=4)
-        whole_loader = DataLoader(whole_dataset, batch_size=train_params['batch_size'], shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=4, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=4, drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
+        whole_loader = DataLoader(whole_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
 
         ## Load best model
-        final_model = build_model(model_params)
+        final_model = build_model(configs.model)
         x_input, _ = next(iter(train_loader))
-        print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
-        if args.tune:
-            best_states = torch.load(os.path.join(train_params['model_path'],f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
+        print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
+        if configs.train.tune:
+            best_states = torch.load(os.path.join(configs.train.model_dir,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
             for k, v in best_states.items():
                 if 'module' not in k:
@@ -214,22 +198,22 @@ if __name__=="__main__":
                 converted_states[k] = v
             final_model.load_state_dict(converted_states)
         else:
-            final_model = train_model(final_model, train_loader, val_loader, model_params, train_params)
+            final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train)
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
         ## Evaluation on train dataset
         # trues_recon_train, trues_y_train, preds_recon_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
-        trues_y_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
+        trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model)
         # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=args.pred_type)
-        if args.pred_type == "classification":
+        eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=configs.data.pred_type)
+        if configs.data.pred_type == "classification":
             eval_y_train, confmat_y_train = eval_y_train
 
         ## Evaluation on test dataset
-        trues_y_test, preds_y_test = validate_model(final_model, test_loader, model_params)
+        trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model)
         # eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=args.pred_type)
-        if args.pred_type == "classification":
+        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=configs.data.pred_type)
+        if configs.data.pred_type == "classification":
             eval_y_test, confmat_y_test = eval_y_test
 
         eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
@@ -242,8 +226,11 @@ if __name__=="__main__":
 
         print("Training is done!\n")
     else:
-        final_model = build_model(model_params)
-        best_states = torch.load(final_model_path)
+        final_model = build_model(configs.model)
+        if os.path.exists(final_model_path):
+            best_states = torch.load(final_model_path)
+        else:
+            raise Exception("Model need to be trained first")
         converted_states = OrderedDict()
         for k, v in best_states.items():
             if 'module' not in k:
@@ -253,54 +240,10 @@ if __name__=="__main__":
             converted_states[k] = v
         final_model.load_state_dict(converted_states)
 
-        data_loader = DataLoader(tech_dataset, batch_size=args.batch_size)
+        data_loader = DataLoader(tech_dataset, batch_size=configs.train.batch_size)
 
-        trues_y, preds_y = validate_model(final_model, data_loader, model_params)
+        trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
         # eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=args.pred_type)
-        if args.pred_type == "classification":
+        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
+        if configs.data.pred_type == "classification":
             eval_y, confmat_y = eval_y
-    #
-    # ## TEST: new sample generation from latent vector only
-    # data_loader = DataLoader(tech_dataset, batch_size=10)
-    # xs, ys = next(iter(data_loader))
-    # x = xs[0].unsqueeze(0).to(device)
-    # print(f"Generation test\nExample: {token2class(x.tolist(), vocabulary=model_params['vocabulary_rev'])}")
-    # o_enc, h_enc = final_model.module.encoder(x)
-    # # h_enc = h_enc.view(n_layers, n_directions, batch_size, hidden_dim)
-    #
-    # # Take the last layer hidden vector as latent vector
-    # # z = z[-1].view(1, batch_size, -1) # last layer hidden_vector -> (1, batch_size, hidden_dim * n_directions)
-    # z = h_enc
-    # new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
-    # next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
-    # for t in range(1, model_params['max_len']):
-    #     embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
-    #     gru_input = torch.cat((embedded, z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
-    #     o_dec, h_dec = final_model.module.decoder.gru(gru_input, z)
-    #     output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
-    #     prediction = output.argmax(1)
-    #
-    #     next_input = prediction
-    #     new_outputs[:,:,t] = output
-    # new_outputs = new_outputs.argmax(1)
-    #
-    # print(f"Generated output (using the original latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")
-    #
-    # # What if adding noise to latent vector?
-    # # new_z = z + z.mean().item() * 5e-1
-    # new_z = z + torch.rand((z.shape)).to(device) * 1e-4
-    # new_outputs = torch.zeros(1, model_params['vocab_size'], model_params['max_len'])
-    # next_input = torch.from_numpy(np.tile([model_params['vocabulary'][TOKEN_SOS]], 1)).to(device)
-    # for t in range(1, model_params['max_len']):
-    #     embedded = final_model.module.decoder.dropout(final_model.module.decoder.embedding(next_input.unsqueeze(1)))
-    #     gru_input = torch.cat((embedded, new_z[-1].unsqueeze(0)), dim=2) # Replace attention weights with latent vector
-    #     o_dec, h_dec = final_model.module.decoder.gru(gru_input, h_enc)
-    #     output = final_model.module.decoder.fc_out(torch.cat((o_dec.squeeze(1), z[-1], embedded.squeeze(1)), dim=1))
-    #     prediction = output.argmax(1)
-    #
-    #     next_input = prediction
-    #     new_outputs[:,:,t] = output
-    # new_outputs = new_outputs.argmax(1)
-    #
-    # print(f"Generated output (using changed latent vector from encoder): {token2class(new_outputs.tolist(), vocabulary=tech_dataset.vocab_i2w)}")

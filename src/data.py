@@ -36,29 +36,24 @@ from cleantext.sklearn import CleanTransformer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-TOKEN_SOS = '<SOS>'
-TOKEN_EOS = '<EOS>'
-TOKEN_PAD = '<PAD>'
-
-regex = re.compile("[0-9a-zA-Z\/]+")
+TOKEN_SOS = "<SOS>"
+TOKEN_EOS = "<EOS>"
+TOKEN_PAD = "<PAD>"
 
 class TechDataset(Dataset):
-    def __init__(self, data_dir="", params=None, do_transform=False):
+    def __init__(self, config):
         super().__init__()
         self.tokens = [TOKEN_SOS, TOKEN_EOS, TOKEN_PAD]
 
-        for key, value in params.items():
+        for key, value in config.items():
             setattr(self, key, value)
 
-        self.do_transform = do_transform
-
         if self.data_type in ["class", "claim"]:
-            self.rawdata = pd.read_csv(os.path.join(data_dir, "collection_final_with_claims.csv"))
+            self.rawdata = pd.read_csv(os.path.join(config.data_dir, "collection_final_with_claims.csv"))
             self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess()
             self.original_idx = np.array(self.data.index)
-            self.X, self.Y = self.make_io()
+            self.X, self.Y, self.Y_quantized = self.make_io()
         elif self.data_type == "mnist":
-            # self.rawdata = load_digits()
             self.rawdata = torchvision.datasets.MNIST('data', train=True, download=True)
             self.data = self.rawdata.data.view(len(self.rawdata.data), -1).numpy()
             self.X = self.data
@@ -87,25 +82,16 @@ class TechDataset(Dataset):
             tokened_claims = self.data['claims'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
             X = tokened_claims.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
 
-        # X = pd.concat(X)
-        # Y = self.data['TC'+str(self.n_TC)]
-        # if self.pred_type == "classification":
-        #     new_Y = np.zeros_like(Y.values).astype(int)
-        #     new_Y[Y>0] = 1
-        #     Y = pd.
         X = np.vstack(X.values)
         Y = self.data['TC'+str(self.n_TC)].values
-        if self.pred_type == "classification":
-            new_Y = np.zeros_like(Y).astype(int)
-            new_Y[Y>0] = 1
-            # new_Y[np.random.choice(np.arange(len(Y)), int(len(Y)/3)*2, replace=False)] = 1
-            # print(int(len(Y)/2), new_Y.sum())
-            Y = new_Y
-            # Y_str = self.rawdata.set_index('number').loc[self.data.index]['main ipc'].apply(lambda x: str(x)[:4])
-            # classes = list(np.unique(Y_str))
-            # Y = Y_str.apply(lambda x: classes.index(x)).values
 
-        return X, Y
+        Y_quantized = np.zeros_like(Y).astype(int)
+        Y_quantized[Y>0] = 1
+
+        if self.pred_type == "classification":
+            Y = Y_quantized
+
+        return X, Y, Y_quantized
 
     def transform(self, sample):
         main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
@@ -114,6 +100,7 @@ class TechDataset(Dataset):
         return X, Y
 
     def preprocess(self):
+        regex = re.compile("[0-9a-zA-Z\/]+")
         cols_year = ['<1976']+list(np.arange(1976,2018).astype(str))
 
         if self.data_type == "class":
@@ -208,7 +195,8 @@ class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify
         # self.oversampled = oversampled
-        self.labels = dataset.Y
+        # self.labels = dataset.Y
+        self.labels = dataset.Y_quantized
         self.original_idx = dataset.original_idx
         self.dataset = dataset
         self.test_ratio = test_ratio
