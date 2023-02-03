@@ -15,6 +15,7 @@ import copy
 import functools
 import operator
 import time
+import re
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
@@ -24,6 +25,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score
 
 from data import TechDataset, CVSampler
@@ -189,15 +191,11 @@ def build_model(model_params={}, trial=None):
         model_params['d_hidden'] = trial.suggest_categorical("d_hidden", [32, 64, 128, 256, 512])
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'], model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'])
 
-    ## Construct networks
-    # enc = Encoder_SEQ(params=model_params).to(device=device, dtype=torch.float)
-    # att = Attention(params=model_params).to(device=device, dtype=torch.float)
-    # dec = AttnDecoder_SEQ(attention=att, params=model_params).to(device=device, dtype=torch.float)
-    # pred = Predictor(params=model_params).to(device=device, dtype=torch.float)
-    # model = SEQ2SEQ(device=device, enc=enc, dec=dec, pred=pred, vocab=model_params['vocabulary'], max_len=model_params['max_len']).to(device=device, dtype=torch.float)
-    # model = torch.nn.DataParallel(model, device_ids=device_ids)
-
     model = Transformer(model_params)
+    if re.search("^2.", torch.__version__) is not None:
+        print("INFO: PyTorch 2.* imported, compile model")
+        model = torch.compile(model)
+
     if len(device_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
 
@@ -211,9 +209,10 @@ def epoch_time(start, end):
 
 def train_model(model, train_loader, val_loader, model_params={}, train_params={}, trial=None):
     device = model_params['device']
+    writer = SummaryWriter(log_dir=os.path.join(train_params['root_dir'], "results", "TB_logs"))
 
     ## Loss function and optimizers
-    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_pad'])
+    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
     loss_y = torch.nn.MSELoss()
 
     if trial is not None:
@@ -229,7 +228,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Training
     if train_params['use_early_stopping']:
-        early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'],"models/ES_checkpoint_"+train_params['train_param_name']+".ckpt"))
+        early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'],"models/ES_checkpoint_"+train_params['config_name']+".ckpt"))
 
     for ep in range(max_epochs):
         epoch_start = time.time()
@@ -243,12 +242,16 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         print(f'Epoch: {ep + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
         # print(f"Avg train loss: {train_loss['total']:>5f}, Avg val loss: {val_loss['total']:>5f}\n")
         print(f"Avg train loss: {train_loss:>5f}, Avg val loss: {val_loss:>5f}\n")
+        writer.add_scalar("Loss/train", train_loss, ep)
+        writer.add_scalar("Loss/val", val_loss, ep)
 
         if train_params['use_early_stopping']:
-            model = early_stopping(val_loss['total'], model)
+            model = early_stopping(val_loss, model)
             if early_stopping.early_stop:
                 print("Early stopped\n")
                 break
+    writer.flush()
+    writer.close()
     return model
 
 def validate_model(model, val_loader, model_params={}):
@@ -257,10 +260,12 @@ def validate_model(model, val_loader, model_params={}):
     for batch, (X_batch, Y_batch) in enumerate(val_loader):
         trues_recon_val.append(X_batch.cpu().detach().numpy())
         trues_y_val.append(Y_batch.cpu().detach().numpy())
-        preds_recon_batch, preds_y_batch, z_batch = model.module(X_batch.to(device=model_params['device']))
+        # preds_recon_batch, preds_y_batch, z_batch = model.module(X_batch.to(device=model_params['device']))
+        preds_recon_batch, *_ = model.module(X_batch.to(device=model_params['device']), X_batch[:,:-1].to(device=model_params['device']))
         preds_recon_val.append(preds_recon_batch.cpu().detach().numpy())
-        preds_y_val.append(preds_y_batch.cpu().detach().numpy())
-    return [np.concatenate(x) for x in [trues_recon_val, trues_y_val, preds_recon_val, preds_y_val]]
+        # preds_y_val.append(preds_y_batch.cpu().detach().numpy())
+    # return [np.concatenate(x) for x in [trues_recon_val, trues_y_val, preds_recon_val, preds_y_val]]
+    return [np.concatenate(x) for x in [trues_recon_val, preds_recon_val]]
 
 def objective(trial, train_loader, val_loader, model_params_obj={}, train_params_obj={}):
     model = build_model(model_params_obj, trial=trial)
@@ -302,7 +307,7 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
     return np.mean(scores)
 
-def perf_eval(model_name, trues, preds, pred_type='regression', vocabulary=None):
+def perf_eval(model_name, trues, preds, configs=None, pred_type='regression'):
     if pred_type == 'classification_binary':
         metric_list = ['Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
         # eval_res = pd.DataFrame(columns=metric_list)
@@ -338,11 +343,11 @@ def perf_eval(model_name, trues, preds, pred_type='regression', vocabulary=None)
         # cols = ['Origin SEQ', 'Generated SEQ']
         # eval_res = pd.DataFrame(columns=cols)
 
-        assert vocabulary is not None, "Vocabulary is needed to evaulate Generative model"
-        trues_class = pd.Series(token2class(trues.tolist(), vocabulary=vocabulary))
+        assert configs is not None, "Configuration is needed to evaulate Generative model"
+        trues_class = pd.Series(token2class(trues.tolist(), configs=configs))
         if trues.shape != preds.shape:
             preds = preds.argmax(1)
-        preds_class = pd.Series(token2class(preds.tolist(), vocabulary=vocabulary))
+        preds_class = pd.Series(token2class(preds.tolist(), configs=configs))
 
         eval_res = pd.concat([trues_class, preds_class], axis=1)
         eval_res.columns = ['Origin SEQ', 'Generated SEQ']

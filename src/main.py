@@ -17,6 +17,7 @@ import argparse
 import math
 import time
 import pickle
+import re
 import warnings
 warnings.filterwarnings(action='ignore', category=UserWarning)
 warnings.filterwarnings(action='ignore', category=DeprecationWarning)
@@ -63,12 +64,19 @@ if __name__=="__main__":
     configs = DotDict().load("configs.json")
     org_config_keys = {key: list(configs[key].keys()) for key in configs.keys()}
 
+    args = parser.parse_args()
+    instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
+    instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
+    for key, value in configs.items():
+        value.update(instant_configs_for_update[key])
+
     data_dir = os.path.join(root_dir, "data")
     model_dir = os.path.join(root_dir, "models")
 
     if torch.cuda.is_available():
         device_ids = list(range(torch.cuda.device_count()))
-        device_ids = np.argsort(list(map(torch.cuda.memory_allocated, device_ids)))[::-1][:configs.train.n_gpus]
+        gpu_usages = [np.sum([float(usage.split("uses")[-1].replace(" ","").replace("MB","")) for usage in torch.cuda.list_gpu_processes(id).split("GPU memory") if not usage=="" and "no processes are running" not in usage]) for id in device_ids]
+        device_ids = np.argsort(gpu_usages)[:configs.train.n_gpus]
         device_ids = list(map(lambda x: torch.device('cuda', x),list(device_ids)))
         device = device_ids[0] # main device
     else:
@@ -108,12 +116,6 @@ if __name__=="__main__":
     configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
                             "final_model_path": final_model_path})
-
-    args = parser.parse_args()
-    instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
-    instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
-    for key, value in configs.items():
-        value.update(instant_configs_for_update[key])
 
     ''' PART 2: Dataset setting '''
     print("Load dataset...")
@@ -160,10 +162,6 @@ if __name__=="__main__":
 
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
             confgis.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
-            #
-            # train_param_name = f"{model_params['n_layers']}layers_{model_params['embedding_dim']}emb_{model_params['hidden_dim']}hid_{model_params['n_directions']}direc_{np.round(train_params['learning_rate'],4)}lr_{configs.train.batch_size}batch_{train_params['max_epochs']}ep"
-            # final_model_path = os.path.join(model_path, f"[Final_model][{args.target_ipc}]{train_param_name}.ckpt")
-
             config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
             final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
@@ -186,8 +184,14 @@ if __name__=="__main__":
         ## Load best model
         final_model = build_model(configs.model)
         x_input, _ = next(iter(train_loader))
-        print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
-        if configs.train.tune:
+        if re.search("^1.", torch.__version__) is not None:
+            print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
+        else:
+            print("INFO: pytorch-model-summary does not support PyTorch 2.0, so just print model structure")
+            print(final_model)
+            torch._dynamo.config.verbose = True
+            torch._dynamo.config.suppress_errors = True
+        if configs.train.do_tune:
             best_states = torch.load(os.path.join(configs.train.model_dir,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
             for k, v in best_states.items():
@@ -202,21 +206,23 @@ if __name__=="__main__":
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
         ## Evaluation on train dataset
-        # trues_recon_train, trues_y_train, preds_recon_train, preds_y_train = validate_model(final_model, whole_loader, model_params)
-        trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model)
-        # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=configs.data.pred_type)
-        if configs.data.pred_type == "classification":
-            eval_y_train, confmat_y_train = eval_y_train
+        trues_recon_train, preds_recon_train = validate_model(final_model, whole_loader, configs.model)
+        # trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model)
+        eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative')
+        # eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=configs.data.pred_type)
+        # if configs.data.pred_type == "classification":
+        #     eval_y_train, confmat_y_train = eval_y_train
 
         ## Evaluation on test dataset
-        trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model)
-        # eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=configs.data.pred_type)
-        if configs.data.pred_type == "classification":
-            eval_y_test, confmat_y_test = eval_y_test
+        trues_recon_test, preds_recon_test = validate_model(final_model, test_loader, configs.model)
+        # trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model)
+        eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative')
+        # eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=configs.data.pred_type)
+        # if configs.data.pred_type == "classification":
+        #     eval_y_test, confmat_y_test = eval_y_test
 
-        eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+        # eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+        eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
         result_path = os.path.join(root_dir, "results")
         # with pd.ExcelWriter(os.path.join(result_path,f"[RESULT][{args.target_ipc}]{train_param_name}.xlsx")) as writer:

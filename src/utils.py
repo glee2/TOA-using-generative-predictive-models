@@ -27,7 +27,12 @@ from sklearn.metrics import confusion_matrix
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def token2class(sequences, vocabulary=None, remove_extra=True):
+def token2class(sequences, configs, remove_extra=True):
+    TOKEN_SOS = "<SOS>"
+    TOKEN_PAD = "<PAD>"
+    TOKEN_EOS = "<EOS>"
+    
+    vocabulary = configs.model.vocabulary_rev
     assert vocabulary is not None, "Vocabulary is empty"
     if not isinstance(sequences, list):
         sequences = [sequences]
