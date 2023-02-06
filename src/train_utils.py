@@ -6,7 +6,7 @@ Description (primary changes): Employ "Accelerator" from huggingface, to automat
 '''
 
 # Set root directory
-root_dir = '/home2/glee/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 

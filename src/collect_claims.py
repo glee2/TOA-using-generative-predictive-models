@@ -5,7 +5,7 @@ Version: 0.1
 Description (primary changes): Collect claims for the patents in "collection_final.csv"
 '''
 # Set root directory
-root_dir = '/home2/glee/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 
 import sys
 sys.path.append("/share/uspto_pkg")
