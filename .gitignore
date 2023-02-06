@@ -1,9 +1,9 @@
 models/*
 !models/.keep
 src_backup/*
-src/__pycache__/*
-src/runs/*
-src/.ipynb_checkpoints/*
+src/__pycache__/
+src/runs/
+src/.ipynb_checkpoints/
 results/*
 !results/.keep
 data/
