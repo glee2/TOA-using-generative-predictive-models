@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.4
-Description (primary changes): Add functions for hyperparameter tuning
+Version: 0.5
+Description (primary changes): Employ "Accelerator" from huggingface, to automate gpu-distributed training
 '''
 
 # Set root directory
@@ -26,7 +26,8 @@ import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score
+# from accelerate import Accelerator
+from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
 # from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
@@ -132,7 +133,8 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
     loss_out = {l: np.mean(loss_out[l]) for l in loss_out.keys()}
     return loss_out
 
-def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train', device='cpu'):
+def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train', train_params={}):
+    device = train_params['device']
     clip_max_norm = 1
     if mode=="train":
         model.train()
@@ -147,10 +149,15 @@ def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train'
             # output: (batch_size, n_dec_seq-1, n_dec_vocab)
             output_dim = pred_trg.shape[-1]
             pred_trg = pred_trg.contiguous().view(-1, output_dim) # output: (batch_size * (n_dec_seq-1))
+            # pred_trg = pred_trg.argmax(2).contiguous().to(device=device, dtype=torch.float32) # pred_trg = (batch_size * (n_dec_seq-1))
             true_trg = trg[:,1:].contiguous().view(-1) # omit <sos> from target sequence
+            # true_trg = trg[:,1:].contiguous().to(device=device, dtype=torch.float32) # omit <sos> from target sequence
 
             loss = loss_f(pred_trg, true_trg)
-            loss.backward()
+            if train_params['use_accelerator']:
+                train_params['accelerator'].backward(loss)
+            else:
+                loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
             optimizer.step()
 
@@ -191,12 +198,12 @@ def build_model(model_params={}, trial=None):
         model_params['d_hidden'] = trial.suggest_categorical("d_hidden", [32, 64, 128, 256, 512])
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'], model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'])
 
-    model = Transformer(model_params)
+    model = Transformer(model_params).to(device)
     if re.search("^2.", torch.__version__) is not None:
         print("INFO: PyTorch 2.* imported, compile model")
         model = torch.compile(model)
 
-    if len(device_ids) > 1:
+    if len(device_ids) > 1 and not model_params['use_accelerator']:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     return model
@@ -210,6 +217,8 @@ def epoch_time(start, end):
 def train_model(model, train_loader, val_loader, model_params={}, train_params={}, trial=None):
     device = model_params['device']
     writer = SummaryWriter(log_dir=os.path.join(train_params['root_dir'], "results", "TB_logs"))
+    if train_params['use_accelerator']:
+        accelerator = train_params['accelerator']
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
@@ -226,6 +235,10 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=train_params['learning_rate'])
 
+    ## Accelerator wrapping
+    if train_params['use_accelerator']:
+        model, train_loader, val_loader, optimizer = accelerator.prepare(model, train_loader, val_loader, optimizer)
+
     ## Training
     if train_params['use_early_stopping']:
         early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'],"models/ES_checkpoint_"+train_params['config_name']+".ckpt"))
@@ -235,8 +248,8 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         print(f"Epoch {ep+1}\n"+str("-"*25))
         # train_loss = run_epoch(train_loader, model, loss_recon, loss_y, mode='train', optimizer=optimizer, loss_weights=train_params['loss_weights'], device=device)
         # val_loss = run_epoch(val_loader, model, loss_recon, loss_y, mode='test', loss_weights=train_params['loss_weights'], device=device)
-        train_loss = run_epoch_temp(train_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='train', device=device)
-        val_loss = run_epoch_temp(val_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='eval', device=device)
+        train_loss = run_epoch_temp(train_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='train', train_params=train_params)
+        val_loss = run_epoch_temp(val_loader, model, loss_f=loss_recon, optimizer=optimizer, mode='eval', train_params=train_params)
         epoch_end = time.time()
         epoch_mins, epoch_secs = epoch_time(epoch_start, epoch_end)
         print(f'Epoch: {ep + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
@@ -295,15 +308,23 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
         model = build_model(model_params_obj, trial=trial)
         model = train_model(model, train_loader, val_loader, model_params_obj, train_params_obj, trial=trial)
-        trues_recon_val, trues_y_val, preds_recon_val, preds_y_val = validate_model(model, val_loader, model_params=model_params_obj)
+        # trues_recon_val, trues_y_val, preds_recon_val, preds_y_val = validate_model(model, val_loader, model_params=model_params_obj)
+        trues_recon_val, preds_recon_val = validate_model(model, val_loader, model_params=model_params_obj)
 
-        score_mse = mean_squared_error(trues_y_val, preds_y_val)
+        # score_mse = mean_squared_error(trues_y_val, preds_y_val)
 
-        scores.append(score_mse)
+        # scores.append(score_mse)
+
+        ## Cross entropy loss
+        trues_recon_val = torch.tensor(trues_recon_val[:,1:]).contiguous().to(device=model_params['device'], dtype=torch.float32)
+        preds_recon_val = torch.tensor(preds_recon_val).argmax(2).contiguous().to(device=model_params['device'], dtype=torch.float32)
+        score_ce = F.cross_entropy(trues_recon_val, preds_recon_val).cpu().numpy()
+        scores.append(score_ce)
+
         trained_models.append(model)
 
     best_model = trained_models[np.argmax(scores)].module
-    torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_path'],"hparam_tuning",f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
+    torch.save(best_model.state_dict(), os.path.join(train_params_obj['tuned_model_path'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
 
     return np.mean(scores)
 

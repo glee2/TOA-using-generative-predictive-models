@@ -173,9 +173,9 @@ class TechDataset(Dataset):
         cleaned = cleaned.apply(lambda claim: list(np.array(claim)[np.sort(np.unique(claim, return_index=True)[1])]))
         # Remove too frequent or too rare words
         vocab, vocab_counts = np.unique(np.concatenate(cleaned.values), return_counts=True)
-        freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.4))[0]] # frequent words: words that appear more than 40% of the data samples
-        # rare_words = vocab[np.where(vocab_counts<3)[0]] # rare words: words that appear less than 2 times
-        rare_words = vocab[np.where(vocab_counts<int(len(cleaned)*0.01))[0]] # rare words: words that appear less than 0.1% of the data samples
+        freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.5))[0]] # frequent words: words that appear more than 40% of the data samples
+        rare_words = vocab[np.where(vocab_counts<3)[0]] # rare words: words that appear less than 2 times
+        # rare_words = vocab[np.where(vocab_counts<int(len(cleaned)*0.01))[0]] # rare words: words that appear less than 0.1% of the data samples
         print(f"FREQ: {freq_words} ({len(freq_words)}), RARE: {rare_words} ({len(rare_words)})")
         cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
 

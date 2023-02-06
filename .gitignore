@@ -1,5 +1,8 @@
 models/*
+!models/.keep
 src_backup/*
 src/__pycache__/*
 results/*
+!results/.keep
 data/
+!data/.keep

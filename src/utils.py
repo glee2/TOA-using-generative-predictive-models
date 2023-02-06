@@ -31,7 +31,7 @@ def token2class(sequences, configs, remove_extra=True):
     TOKEN_SOS = "<SOS>"
     TOKEN_PAD = "<PAD>"
     TOKEN_EOS = "<EOS>"
-    
+
     vocabulary = configs.model.vocabulary_rev
     assert vocabulary is not None, "Vocabulary is empty"
     if not isinstance(sequences, list):
@@ -152,7 +152,7 @@ class DotDict(dict):
                 # Does this same name occur starting with ``#``?
                 return self[f"#{name}"]
             # Otherwise, raise the original exception
-            raise
+            raise AttributeError(name)
 
     def __setattr__(self, name, val):
         self.__setitem__(name, val)

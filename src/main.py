@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.61
-Description (primary changes): Configuration through .json; instant configuration input through argument parsing
+Version: 0.7
+Description (primary changes): Employ "Accelerator" from huggingface, to automate gpu-distributed training
 '''
 
 # Set root directory
@@ -31,6 +31,7 @@ import torch
 from torch.nn import functional as F
 from torch.nn import DataParallel as DP
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from accelerate import Accelerator
 import pytorch_model_summary
 
 import optuna
@@ -53,11 +54,13 @@ from utils import token2class, DotDict
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_type", type=str)
 parser.add_argument("--target_ipc", type=str)
+parser.add_argument("--do_save", default=None, action="store_true")
 parser.add_argument("--pred_type", type=str)
 parser.add_argument("--do_train", default=None, action="store_true")
 parser.add_argument("--do_tune", default=None, action="store_true")
 parser.add_argument("--n_folds", type=int)
 parser.add_argument("--max_epochs", type=int)
+parser.add_argument("--use_accelerator", default=None, action="store_true")
 
 if __name__=="__main__":
     ''' PART 1: Configuration '''
@@ -73,27 +76,38 @@ if __name__=="__main__":
     data_dir = os.path.join(root_dir, "data")
     model_dir = os.path.join(root_dir, "models")
 
-    if torch.cuda.is_available():
+    if configs.train.use_accelerator:
+        accelerator = Accelerator()
         device_ids = list(range(torch.cuda.device_count()))
-        gpu_usages = [np.sum([float(usage.split("uses")[-1].replace(" ","").replace("MB","")) for usage in torch.cuda.list_gpu_processes(id).split("GPU memory") if not usage=="" and "no processes are running" not in usage]) for id in device_ids]
-        device_ids = np.argsort(gpu_usages)[:configs.train.n_gpus]
-        device_ids = list(map(lambda x: torch.device('cuda', x),list(device_ids)))
-        device = device_ids[0] # main device
+        device = accelerator.device
+
+        configs.train.update({"accelerator": accelerator})
+        # configs.model.update({"use_accelerator": configs.train.use_accelerator})
     else:
-        device = torch.device('cpu')
-        device_ids = []
+        if torch.cuda.is_available():
+            device_ids = list(range(torch.cuda.device_count()))
+            gpu_usages = [np.sum([float(usage.split("uses")[-1].replace(" ","").replace("MB","")) for usage in torch.cuda.list_gpu_processes(id).split("GPU memory") if not usage=="" and "no processes are running" not in usage]) for id in device_ids]
+            device_ids = np.argsort(gpu_usages)[:configs.train.n_gpus]
+            device_ids = list(map(lambda x: torch.device('cuda', x),list(device_ids)))
+            device = device_ids[0] # main device
+        else:
+            device = torch.device('cpu')
+            device_ids = []
 
     configs.data.update({"root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir})
-    configs.model.update({"device": device,
+    configs.train.update({"device": device,
                             "device_ids": device_ids,
-                            "n_directions": 2 if configs.model.bidirec else 1,
-                            "n_outputs": 1 if configs.data.pred_type=="regression" else 2})
-    configs.train.update({"root_dir": root_dir,
+                            "root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir,
                             "early_stop_patience": int(0.3*configs.train.max_epochs)})
+    configs.model.update({"device": device,
+                            "device_ids": device_ids,
+                            "n_directions": 2 if configs.model.bidirec else 1,
+                            "n_outputs": 1 if configs.data.pred_type=="regression" else 2,
+                            "use_accelerator": configs.train.use_accelerator})
 
     ## Set hyperparameters for model training (To be TUNED)
     if configs.train.do_train and configs.train.do_tune:
@@ -122,24 +136,25 @@ if __name__=="__main__":
     tstart = time.time()
     dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys["data"]])
     dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
-    if os.path.exists(dataset_path):
+    if os.path.exists(dataset_path) and configs.data.do_save is False:
         with open(dataset_path, "rb") as f:
             tech_dataset = pickle.load(f)   # Load pickled dataset if dataset with same configuration already saved
         print("Pickled dataset loaded")
     else:
         tech_dataset = TechDataset(configs.data)
         with open(dataset_path, "wb") as f:
+            tech_dataset.rawdata = None
             pickle.dump(tech_dataset, f)
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
-    configs.model.__dict__.update({"vocabulary": tech_dataset.vocab_w2i,
+    configs.model.update({"vocabulary": tech_dataset.vocab_w2i,
                             "vocabulary_rev": tech_dataset.vocab_i2w,
                             "n_enc_vocab": tech_dataset.vocab_size,
                             "n_dec_vocab": tech_dataset.vocab_size,
                             "n_enc_seq": tech_dataset.seq_len,
                             "n_dec_seq": tech_dataset.seq_len,
-                            "i_pad": tech_dataset.vocab_w2i["<PAD>"]})
+                            "i_padding": tech_dataset.vocab_w2i["<PAD>"]})
 
     ''' PART 3: Training '''
     if configs.train.do_train:
@@ -149,6 +164,7 @@ if __name__=="__main__":
 
         ''' PART 3-1: Hyperparmeter tuning '''
         if configs.train.do_tune:
+            configs.train.update({"tuned_model_path": os.path.join(model_dir,"hparam_tuning")})
             optuna_obj = lambda trial: objective_cv(trial, dataset=tech_dataset, cv_idx=cv_idx, model_params=configs.model, train_params=configs.train)
 
             opt_sampler = TPESampler()
@@ -161,7 +177,7 @@ if __name__=="__main__":
                 print(f"    {k}: {v}")
 
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
-            confgis.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
+            configs.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
             config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
             final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
@@ -192,7 +208,7 @@ if __name__=="__main__":
             torch._dynamo.config.verbose = True
             torch._dynamo.config.suppress_errors = True
         if configs.train.do_tune:
-            best_states = torch.load(os.path.join(configs.train.model_dir,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
+            best_states = torch.load(os.path.join(configs.train.tuned_model_path,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
             for k, v in best_states.items():
                 if 'module' not in k:
