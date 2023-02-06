@@ -27,7 +27,6 @@ from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
 from sklearn.datasets import load_digits
 
-<<<<<<< HEAD
 # Text cleaning libraries
 import nltk
 from nltk.corpus import stopwords
