@@ -35,7 +35,6 @@ from models import Transformer
 from utils import token2class
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-profiler_activity = ProfilerActivity.CUDA if device is torch.device('cuda') else ProfilerActivity.CPU
 
 class EarlyStopping:
     def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt'):
@@ -85,7 +84,6 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
     loss_weights['y'] = 1 - loss_weights['recon']
 
     loss_out = {'total': [], 'recon': [], 'y': []}
-
     # batch_losses = []
     if mode == 'train':
         model.train()
@@ -130,44 +128,6 @@ def run_epoch(dataloader, model, loss_recon, loss_y, mode='train', optimizer=Non
                 loss_out['recon'].append(batch_loss_recon.item())
                 loss_out['y'].append(batch_loss_y.item())
                 loss_out['total'].append(batch_loss_total.item())
-
-                if device == torch.device('cuda'):
-                    print(f"Before - Allocated mem: {np.round(torch.cuda.memory_allocated()*1e-6, 2}Mb, Cache mem: {np.round(torch.cuda.memory_reserved()*1e-6, 2}Mb")
-                    del X
-                    del Y
-                    del preds_recon
-                    del preds_y
-                    torch.cuda.empty_cache()
-                    print(f"After - Allocated mem: {np.round(torch.cuda.memory_allocated()*1e-6, 2}Mb, Cache mem: {np.round(torch.cuda.memory_reserved()*1e-6, 2}Mb\n")
-
-                optimizer.zero_grad()
-                # batch_loss_total.sum().backward()
-                batch_loss_total.backward()
-                optimizer.step()
-
-                if batch % 10 == 0 or batch == len(dataloader)-1:
-                    loss, current = batch_loss_total.item(), batch*batch_len
-                    if batch == len(dataloader)-1:
-                        current = size
-                    print(f"loss: {loss:>7f} [{current:>5d}/{size:>5d}]", end='\r', flush=True)
-        else:
-            # with record_function("validation_phase"):
-            model.eval()
-            with torch.no_grad():
-                for X, Y in dataloader:
-                    X, Y = X.to(device, dtype=torch.long), Y.to(device, dtype=torch.long) # X: (batch_size, seq_len)
-                    with record_function("validation_phase"):
-                        preds_recon, preds_y, z = model(X) # preds_recon: (batch_size, vocab_size, seq_len), preds_y: (batch_size, 1), z: (n_layers, batch_size, hidden_dim * n_directions)
-                    trues_recon = X
-                    trues_y = Y
-
-                    batch_loss_recon = loss_weights['recon']*loss_recon(preds_recon, trues_recon)
-                    batch_loss_y = loss_weights['y']*loss_y(preds_y, trues_y)
-                    batch_loss_total = sum([batch_loss_recon, batch_loss_y])
-
-                    loss_out['recon'].append(batch_loss_recon.item())
-                    loss_out['y'].append(batch_loss_y.item())
-                    loss_out['total'].append(batch_loss_total.item())
 
     # return np.average(batch_losses)
     loss_out = {l: np.mean(loss_out[l]) for l in loss_out.keys()}

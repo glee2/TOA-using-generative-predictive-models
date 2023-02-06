@@ -54,7 +54,7 @@ from utils import token2class, DotDict
 parser = argparse.ArgumentParser()
 parser.add_argument("--data_type", type=str)
 parser.add_argument("--target_ipc", type=str)
-parser.add_argument("--do_save", default=None, action="store_true")
+parser.add_argument("--do_save", default=False, action="store_true")
 parser.add_argument("--pred_type", type=str)
 parser.add_argument("--do_train", default=None, action="store_true")
 parser.add_argument("--do_tune", default=None, action="store_true")
@@ -132,21 +132,20 @@ if __name__=="__main__":
                             "final_model_path": final_model_path})
 
     ''' PART 2: Dataset setting '''
-    print("Load dataset...")
     tstart = time.time()
-
     dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys["data"]])
     dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
-    if os.path.exists(dataset_path) and configs.data.do_save is False:
+    if os.path.exists(dataset_path) and args.do_save is False:
+        print("Load pickled dataset...")
         with open(dataset_path, "rb") as f:
             tech_dataset = pickle.load(f)   # Load pickled dataset if dataset with same configuration already saved
         print("Pickled dataset loaded")
     else:
+        print("Make dataset...")
         tech_dataset = TechDataset(configs.data)
         with open(dataset_path, "wb") as f:
             tech_dataset.rawdata = None
             pickle.dump(tech_dataset, f)
-
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
