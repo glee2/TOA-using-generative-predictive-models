@@ -6,7 +6,7 @@ Description (primary changes): Add classification
 '''
 
 # Set root directory
-root_dir = '/home2/glee/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/Transformer/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
