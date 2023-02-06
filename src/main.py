@@ -134,6 +134,7 @@ if __name__=="__main__":
     ''' PART 2: Dataset setting '''
     print("Load dataset...")
     tstart = time.time()
+
     dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys["data"]])
     dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
     if os.path.exists(dataset_path) and configs.data.do_save is False:
@@ -145,6 +146,7 @@ if __name__=="__main__":
         with open(dataset_path, "wb") as f:
             tech_dataset.rawdata = None
             pickle.dump(tech_dataset, f)
+
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
