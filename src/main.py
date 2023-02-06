@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.7
-Description (primary changes): Employ "Accelerator" from huggingface, to automate gpu-distributed training
+Version: 0.71
+Description (primary changes): Try VGAE (Variational graph auto-encoder)
 '''
 
 # Set root directory
