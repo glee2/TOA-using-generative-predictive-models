@@ -52,26 +52,50 @@ from train_utils import run_epoch, EarlyStopping, perf_eval, objective_cv, build
 from utils import token2class, DotDict
 
 parser = argparse.ArgumentParser()
+## data arguments
 parser.add_argument("--data_type", type=str)
 parser.add_argument("--target_ipc", type=str)
-parser.add_argument("--do_save", default=False, action="store_true")
 parser.add_argument("--pred_type", type=str)
+
+## training arguments
 parser.add_argument("--do_train", default=None, action="store_true")
 parser.add_argument("--do_tune", default=None, action="store_true")
+parser.add_argument("--learning_rate", type=float)
+parser.add_argument("--batch_size", type=int)
 parser.add_argument("--n_folds", type=int)
 parser.add_argument("--max_epochs", type=int)
+
+## model arguments
 parser.add_argument("--use_accelerator", default=None, action="store_true")
+parser.add_argument("--n_layers", type=int)
+parser.add_argument("--d_embedding", type=int)
+parser.add_argument("--d_hidden", type=int)
+parser.add_argument("--d_ff", type=int)
+parser.add_argument("--n_head", type=int)
+parser.add_argument("--d_head", type=int)
+parser.add_argument("--bidirec", default=False, action="store_true")
+
+## arguments passed only for main.py
+parser.add_argument("--do_save", default=False, action="store_true")
+parser.add_argument("--light", default=False, action="store_true")
 
 if __name__=="__main__":
     ''' PART 1: Configuration '''
-    configs = DotDict().load("configs.json")
+    args = parser.parse_args()
+    config_file = "configs_light.json" if args.light else "configs.json"
+    configs = DotDict().load(config_file)
     org_config_keys = {key: list(configs[key].keys()) for key in configs.keys()}
 
-    args = parser.parse_args()
     instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
     instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
     for key, value in configs.items():
         value.update(instant_configs_for_update[key])
+
+    regex_ipc = re.compile('[A-Z](?![\\D])')
+    if regex_ipc.match(configs.data.target_ipc) is None:
+        configs.data.update({"target_ipc": "ALL"})
+    elif len(configs.data.target_ipc) > 5:
+        configs.data.update({"target_ipc": configs.data.target_ipc[:4]})
 
     data_dir = os.path.join(root_dir, "data")
     model_dir = os.path.join(root_dir, "models")
@@ -173,15 +197,23 @@ if __name__=="__main__":
             study.optimize(optuna_obj, n_trials=configs.train.n_trials, gc_after_trial=True)
             best_params = study.best_trial.params
 
-            print(f"Best trial:\n  MSE: {study.best_trial.value}\n  Params:")
+            print(f"Best trial:\n  CrossEntropyLoss: {study.best_trial.value}\n  Params:")
             for k, v in best_params.items():
                 print(f"    {k}: {v}")
 
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
             configs.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
-            config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
+            key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+
+            config_name = ""
+            for key in key_components.keys():
+                for component in key_components[key]:
+                    config_name += "["+str(configs[key][component])+component+"]"
+
+            # config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
             final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
+        ''' PART 3-2: Dataset construction and model training '''
         ## Construct datasets
         train_idx = cv_idx[0]['train']
         val_idx = cv_idx[0]['val']
@@ -198,7 +230,7 @@ if __name__=="__main__":
         test_loader = DataLoader(test_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
         whole_loader = DataLoader(whole_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
 
-        ## Load best model
+        ## Load best model or train model
         final_model = build_model(configs.model)
         x_input, _ = next(iter(train_loader))
         if re.search("^1.", torch.__version__) is not None:
@@ -208,6 +240,7 @@ if __name__=="__main__":
             print(final_model)
             torch._dynamo.config.verbose = True
             torch._dynamo.config.suppress_errors = True
+
         if configs.train.do_tune:
             best_states = torch.load(os.path.join(configs.train.tuned_model_path,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
@@ -222,6 +255,7 @@ if __name__=="__main__":
             final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train)
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
+        ''' PART 3-3: Training evaluation '''
         ## Evaluation on train dataset
         trues_recon_train, preds_recon_train = validate_model(final_model, whole_loader, configs.model)
         # trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model)

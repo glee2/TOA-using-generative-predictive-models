@@ -48,26 +48,10 @@ class TechDataset(Dataset):
         for key, value in config.items():
             setattr(self, key, value)
 
-        if self.data_type in ["class", "claim"]:
-            self.rawdata = pd.read_csv(os.path.join(config.data_dir, "collection_final_with_claims.csv"))
-            self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess()
-            self.original_idx = np.array(self.data.index)
-            self.X, self.Y, self.Y_quantized = self.make_io()
-        elif self.data_type == "mnist":
-            self.rawdata = torchvision.datasets.MNIST('data', train=True, download=True)
-            self.data = self.rawdata.data.view(len(self.rawdata.data), -1).numpy()
-            self.X = self.data
-            self.Y = self.rawdata.targets.numpy()
-            n_values = self.X.max() - self.X.min() + 1
-            self.vocab_w2i = {str(x): x for x in range(n_values)}
-            self.vocab_w2i.update({self.tokens[i]: n_values+i for i in range(len(self.tokens))})
-            self.vocab_i2w = {x: str(x) for x in range(n_values)}
-            self.vocab_i2w.update({n_values+i: self.tokens[i] for i in range(len(self.tokens))})
-            self.vocab_size = len(self.vocab_w2i.keys())
-
-            self.X = np.concatenate([np.tile([self.vocab_w2i[TOKEN_SOS]], (self.X.shape[0],1)), self.X, np.tile([self.vocab_w2i[TOKEN_EOS]], (self.X.shape[0],1))], axis=1)
-            self.seq_len = self.X.shape[-1]
-            self.original_idx = np.arange(len(self.Y))
+        self.rawdata = pd.read_csv(os.path.join(config.data_dir, "collection_final_with_claims.csv"))
+        self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess()
+        self.original_idx = np.array(self.data.index)
+        self.X, self.Y, self.Y_quantized = self.make_io()
 
         self.n_classes = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
 
@@ -121,7 +105,11 @@ class TechDataset(Dataset):
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
         elif self.data_type == "claim":
             rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','claims']]
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            if self.target_ipc == "ALL":
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+            else:
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            assert len(main_ipcs) != 0, "target ipc is not observed"
             rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
             cleaned_claims = self.text_cleaning(text_list=rawdata_ipc['claims'], claim_level=self.claim_level)
             data = pd.concat([rawdata_ipc[['number']], cleaned_claims.rename('claims')], axis=1)
@@ -173,11 +161,25 @@ class TechDataset(Dataset):
         cleaned = cleaned.apply(lambda claim: list(np.array(claim)[np.sort(np.unique(claim, return_index=True)[1])]))
         # Remove too frequent or too rare words
         vocab, vocab_counts = np.unique(np.concatenate(cleaned.values), return_counts=True)
+
+        # Set criterion for rare words
+        vocab_counts_unique, vocab_counts_frequency = np.unique(vocab_counts, return_counts=True)
+        rare_criterion = 5
+        sum_frequency = 0
+        for i in range(len(vocab_counts_frequency)):
+            sum_frequency += vocab_counts_frequency[i]
+            if sum_frequency > len(vocab) - 1000:
+                rare_criterion = vocab_counts_unique[i]
+                break
+
         freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.5))[0]] # frequent words: words that appear more than 40% of the data samples
-        rare_words = vocab[np.where(vocab_counts<3)[0]] # rare words: words that appear less than 2 times
-        # rare_words = vocab[np.where(vocab_counts<int(len(cleaned)*0.01))[0]] # rare words: words that appear less than 0.1% of the data samples
+        # rare_criterion = 5 if int(len(cleaned)*0.0005) < 10 else int(len(cleaned)*0.0005)
+        # rare_words = vocab[np.where(vocab_counts<5)[0]] # rare words: words that appear less than 2 times
+        rare_words = vocab[np.where(vocab_counts<rare_criterion)[0]] # rare words: words that appear less than 0.5% of the data samples
+        freq_rare_set = set(np.concatenate([freq_words, rare_words]))
         print(f"FREQ: {freq_words} ({len(freq_words)}), RARE: {rare_words} ({len(rare_words)})")
-        cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
+        # cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
+        cleaned = cleaned.apply(lambda x: [word for word in x if word not in freq_rare_set])
 
         return cleaned
 

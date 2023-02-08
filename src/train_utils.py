@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.5
-Description (primary changes): Employ "Accelerator" from huggingface, to automate gpu-distributed training
+Version: 0.51
+Description (primary changes): Employ Pytorch Profiler
 '''
 
 # Set root directory
@@ -26,15 +26,20 @@ import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torch.utils.tensorboard import SummaryWriter
-# from accelerate import Accelerator
+from torch.profiler import profile, record_function, ProfilerActivity
+from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
-# from model import Encoder_SEQ, Attention, AttnDecoder_SEQ, SEQ2SEQ, Predictor
 from models import Transformer
 from utils import token2class
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+ON_IPYTHON = True
+try:
+    get_ipython()
+except:
+    ON_IPYTHON = False
 
 class EarlyStopping:
     def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt'):
@@ -140,12 +145,17 @@ def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train'
         model.train()
         epoch_loss = 0
 
-        for i, (X, Y) in enumerate(data_loader):
+        for i, (X, Y) in tqdm(enumerate(data_loader)):
             src, trg, y = X.to(device), X.to(device), Y.to(device)
 
             optimizer.zero_grad()
 
-            pred_trg, *_ = model(src, trg[:,:-1]) # omit <eos> from target sequence
+            if ON_IPYTHON:
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
+                    with record_function("model_feedforward"):
+                        pred_trg, *_ = model(src, trg[:,:-1]) # omit <eos> from target sequence
+            else:
+                pred_trg, *_ = model(src, trg[:,:-1]) # omit <eos> from target sequence
             # output: (batch_size, n_dec_seq-1, n_dec_vocab)
             output_dim = pred_trg.shape[-1]
             pred_trg = pred_trg.contiguous().view(-1, output_dim) # output: (batch_size * (n_dec_seq-1))
@@ -162,6 +172,10 @@ def run_epoch_temp(data_loader, model, loss_f=None, optimizer=None, mode='train'
             optimizer.step()
 
             epoch_loss += loss.item()
+
+        if ON_IPYTHON:
+            print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
+            print(prof.key_averages().table(sort_by='cpu_time_total', row_limit=10))
 
         return epoch_loss / len(data_loader)
     elif mode=="eval" or mode=="test":
@@ -193,9 +207,12 @@ def build_model(model_params={}, trial=None):
     device_ids = model_params['device_ids']
 
     if trial is not None:
-        model_params['n_layers'] = trial.suggest_int("n_layers", 1, 3)
-        model_params['d_embedding'] = trial.suggest_categorical("d_embedding", [32, 64, 128, 256])
-        model_params['d_hidden'] = trial.suggest_categorical("d_hidden", [32, 64, 128, 256, 512])
+        model_params['n_layers'] = trial.suggest_int("n_layers", model_params["for_tune"]["min_n_layers"], model_params["for_tune"]["max_n_layers"])
+        model_params['d_embedding'] = trial.suggest_categorical("d_embedding", [x for x in np.arange(model_params["for_tune"]["min_d_embedding"],model_params["for_tune"]["max_d_embedding"]+1,step=model_params["for_tune"]["min_d_embedding"]) if model_params["for_tune"]["max_d_embedding"]%x==0])
+        model_params['d_hidden'] = trial.suggest_categorical("d_hidden", [x for x in np.arange(model_params["for_tune"]["min_d_hidden"],model_params["for_tune"]["max_d_hidden"]+1,step=model_params["for_tune"]["min_d_hidden"]) if model_params["for_tune"]["max_d_hidden"]%x==0])
+        model_params['d_ff'] = trial.suggest_categorical("d_ff", [x for x in np.arange(model_params["for_tune"]["min_d_ff"],model_params["for_tune"]["max_d_ff"]+1,step=model_params["for_tune"]["min_d_ff"]) if model_params["for_tune"]["max_d_ff"]%x==0])
+        model_params['n_head'] = trial.suggest_categorical("n_head", [x for x in np.arange(model_params["for_tune"]["min_n_head"],model_params["for_tune"]["max_n_head"]+1,step=model_params["for_tune"]["min_n_head"]) if model_params["for_tune"]["max_n_head"]%x==0])
+        model_params['d_head'] = trial.suggest_categorical("d_head", [x for x in np.arange(model_params["for_tune"]["min_d_head"],model_params["for_tune"]["max_d_head"]+1,step=model_params["for_tune"]["min_d_head"]) if model_params["for_tune"]["max_d_head"]%x==0])
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'], model_params['d_hidden'] * model_params['n_layers'] * model_params['n_directions'])
 
     model = Transformer(model_params).to(device)
@@ -294,12 +311,14 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
     for fold in tqdm(range(train_params['n_folds'])):
         train_dataset = Subset(dataset, cv_idx[fold]['train'])
         val_dataset = Subset(dataset, cv_idx[fold]['val'])
-        max_batch_size = 128 if len(val_dataset) > 128 else len(val_dataset)
+        min_batch_size = 16
+        max_batch_size = 1024 if len(val_dataset) > 1024 else len(val_dataset)
 
         model_params_obj = copy.deepcopy(model_params)
         train_params_obj = copy.deepcopy(train_params)
 
-        train_params_obj['batch_size'] = trial.suggest_int("batch_size", 16, max_batch_size, step=train_params['n_gpus'])
+        # train_params_obj['batch_size'] = trial.suggest_int("batch_size", 32, max_batch_size, step=train_params['n_gpus'])
+        train_params_obj['batch_size'] = trial.suggest_categorical("batch_size", [x for x in np.arange(min_batch_size,max_batch_size+1,step=min_batch_size) if max_batch_size%x==0])
 
         train_loader = DataLoader(train_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=4, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=4, drop_last=True)
