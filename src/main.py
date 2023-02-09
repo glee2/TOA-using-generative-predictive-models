@@ -26,6 +26,7 @@ from tml import utils
 from scipy import io
 from tqdm import tqdm
 from collections import OrderedDict
+from nltk.translate.bleu_score import sentence_bleu
 
 import torch
 from torch.nn import functional as F
@@ -148,8 +149,16 @@ if __name__=="__main__":
         d_embedding = configs.model.d_embedding
         d_hidden = configs.model.d_hidden
         d_latent = configs.model.n_layers * configs.model.d_hidden * configs.model.n_directions
-        config_name = f"{n_layers}layers_{d_embedding}emb_{d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate,4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
+
+        key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+        config_name = ""
+        for key in key_components.keys():
+            for component in key_components[key]:
+                config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
+
+        # config_name = f"{n_layers}layers_{d_embedding}emb_{d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate,4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
+        # final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
     configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
@@ -203,14 +212,12 @@ if __name__=="__main__":
 
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
             configs.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
-            key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
 
+            key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
             config_name = ""
             for key in key_components.keys():
                 for component in key_components[key]:
                     config_name += "["+str(configs[key][component])+component+"]"
-
-            # config_name = f"{configs.model.n_layers}layers_{configs.model.d_embedding}emb_{configs.model.d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate, 4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
             final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
         ''' PART 3-2: Dataset construction and model training '''
@@ -225,10 +232,10 @@ if __name__=="__main__":
         test_dataset = Subset(tech_dataset, test_idx)
         whole_dataset = Subset(tech_dataset, whole_idx)
 
-        train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=4, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=4, drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
-        whole_loader = DataLoader(whole_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=0)
+        whole_loader = DataLoader(whole_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=0)
 
         ## Load best model or train model
         final_model = build_model(configs.model)
@@ -297,10 +304,21 @@ if __name__=="__main__":
             converted_states[k] = v
         final_model.load_state_dict(converted_states)
 
-        data_loader = DataLoader(tech_dataset, batch_size=configs.train.batch_size)
+        del best_states
+        del converted_states
+        torch.cuda.empty_cache()
 
-        trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
-        # eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, pred_type='generative', vocabulary=model_params['vocabulary_rev'])
-        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
-        if configs.data.pred_type == "classification":
-            eval_y, confmat_y = eval_y
+        data_loader = DataLoader(tech_dataset, batch_size=128)
+
+        # trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
+        trues_recon, preds_recon = validate_model(final_model, data_loader, configs.model)
+
+        eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative')
+
+        BLEU_score = np.mean([sentence_bleu([x[0]], x[1]) for x in eval_recon.values])
+        print(f"BLEU scores: {np.round(BLEU_score,4)}")
+
+        # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
+        # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
+        # if configs.data.pred_type == "classification":
+        #     eval_y, confmat_y = eval_y

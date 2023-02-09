@@ -284,17 +284,37 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     writer.close()
     return model
 
+# def validate_model(model, val_loader, model_params={}):
+#     trues_recon_val, trues_y_val = [], []
+#     preds_recon_val, preds_y_val = [], []
+#     for batch, (X_batch, Y_batch) in tqdm(enumerate(val_loader)):
+#         trues_recon_val.append(X_batch[:,1:].cpu().detach().numpy())
+#         # trues_y_val.append(Y_batch.cpu().detach().numpy())
+#         # preds_recon_batch, preds_y_batch, z_batch = model.module(X_batch.to(device=model_params['device']))
+#         preds_recon_batch, *_ = model.module(X_batch.to(device=model_params['device']), X_batch[:,:-1].to(device=model_params['device']))
+#         preds_recon_batch = preds_recon_batch.argmax(2)
+#         preds_recon_val.append(preds_recon_batch.cpu().detach().numpy())
+#         # preds_y_val.append(preds_y_batch.cpu().detach().numpy())
+#     # return [np.concatenate(x) for x in [trues_recon_val, trues_y_val, preds_recon_val, preds_y_val]]
+#     return [np.concatenate(x) for x in [trues_recon_val, preds_recon_val]]
+
 def validate_model(model, val_loader, model_params={}):
     trues_recon_val, trues_y_val = [], []
     preds_recon_val, preds_y_val = [], []
-    for batch, (X_batch, Y_batch) in enumerate(val_loader):
-        trues_recon_val.append(X_batch.cpu().detach().numpy())
-        trues_y_val.append(Y_batch.cpu().detach().numpy())
-        # preds_recon_batch, preds_y_batch, z_batch = model.module(X_batch.to(device=model_params['device']))
-        preds_recon_batch, *_ = model.module(X_batch.to(device=model_params['device']), X_batch[:,:-1].to(device=model_params['device']))
-        preds_recon_val.append(preds_recon_batch.cpu().detach().numpy())
-        # preds_y_val.append(preds_y_batch.cpu().detach().numpy())
-    # return [np.concatenate(x) for x in [trues_recon_val, trues_y_val, preds_recon_val, preds_y_val]]
+    for batch, (X_batch, Y_batch) in tqdm(enumerate(val_loader)):
+        trues_recon_val.append(X_batch[:,1:].cpu().detach().numpy()) # omit <SOS>
+
+        enc_inputs = X_batch.to(device=model_params['device'])
+        enc_outputs, *_ = model.module.encoder(enc_inputs)
+        preds_recon_batch = torch.tile(torch.tensor(model_params.vocabulary["<SOS>"]), dims=(X_batch.shape[0],1)).to(device=model_params['device'])
+
+        for i in range(model_params['n_dec_seq']-1):
+            with torch.no_grad():
+                dec_outputs, *_ = model.module.decoder(preds_recon_batch, enc_inputs, enc_outputs)
+            pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
+            preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
+
+        preds_recon_val.append(preds_recon_batch[:,1:].cpu().detach().numpy()) # omit <SOS>
     return [np.concatenate(x) for x in [trues_recon_val, preds_recon_val]]
 
 def objective(trial, train_loader, val_loader, model_params_obj={}, train_params_obj={}):
@@ -307,42 +327,48 @@ def objective(trial, train_loader, val_loader, model_params_obj={}, train_params
     return score_mse
 
 def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
+    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
+
     scores, trained_models = [], []
     for fold in tqdm(range(train_params['n_folds'])):
         train_dataset = Subset(dataset, cv_idx[fold]['train'])
         val_dataset = Subset(dataset, cv_idx[fold]['val'])
+        test_dataset = Subset(dataset, cv_idx[fold]['test'])
         min_batch_size = 16
         max_batch_size = 1024 if len(val_dataset) > 1024 else len(val_dataset)
 
         model_params_obj = copy.deepcopy(model_params)
         train_params_obj = copy.deepcopy(train_params)
 
-        # train_params_obj['batch_size'] = trial.suggest_int("batch_size", 32, max_batch_size, step=train_params['n_gpus'])
-        train_params_obj['batch_size'] = trial.suggest_categorical("batch_size", [x for x in np.arange(min_batch_size,max_batch_size+1,step=min_batch_size) if max_batch_size%x==0])
+        train_params_obj['batch_size'] = trial.suggest_int("batch_size", min_batch_size, max_batch_size, step=train_params['n_gpus'])
+        # train_params_obj['batch_size'] = trial.suggest_categorical("batch_size", [x for x in np.arange(min_batch_size,max_batch_size+1,step=min_batch_size) if max_batch_size%x==0])
 
-        train_loader = DataLoader(train_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=4, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=4, drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=min_batch_size, shuffle=True, num_workers=0, drop_last=False)
 
         # score_mse = objective(trial, train_loader, val_loader, model_params_obj=model_params_obj, train_params_obj=train_params_obj)
 
         model = build_model(model_params_obj, trial=trial)
         model = train_model(model, train_loader, val_loader, model_params_obj, train_params_obj, trial=trial)
+
+        test_loss = run_epoch_temp(test_loader, model, loss_f=loss_recon, mode='test', train_params=train_params)
+
         # trues_recon_val, trues_y_val, preds_recon_val, preds_y_val = validate_model(model, val_loader, model_params=model_params_obj)
-        trues_recon_val, preds_recon_val = validate_model(model, val_loader, model_params=model_params_obj)
-
-        # score_mse = mean_squared_error(trues_y_val, preds_y_val)
-
-        # scores.append(score_mse)
-
-        ## Cross entropy loss
-        trues_recon_val = torch.tensor(trues_recon_val[:,1:]).contiguous().to(device=model_params['device'], dtype=torch.float32)
-        preds_recon_val = torch.tensor(preds_recon_val).argmax(2).contiguous().to(device=model_params['device'], dtype=torch.float32)
-        score_ce = F.cross_entropy(trues_recon_val, preds_recon_val).cpu().numpy()
-        scores.append(score_ce)
-
+        # trues_recon_val, preds_recon_val = validate_model(model, val_loader, model_params=model_params_obj)
+        #
+        # # score_mse = mean_squared_error(trues_y_val, preds_y_val)
+        #
+        # # scores.append(score_mse)
+        #
+        # ## Cross entropy loss
+        # trues_recon_val = torch.tensor(trues_recon_val[:,1:]).contiguous().to(device=model_params['device'], dtype=torch.float32)
+        # preds_recon_val = torch.tensor(preds_recon_val).argmax(2).contiguous().to(device=model_params['device'], dtype=torch.float32)
+        # score_ce = F.cross_entropy(trues_recon_val, preds_recon_val, ignore_index=model_params["i_padding"]).cpu().numpy()
+        scores.append(test_loss)
         trained_models.append(model)
 
-    best_model = trained_models[np.argmax(scores)].module
+    best_model = trained_models[np.argmin(scores)].module
     torch.save(best_model.state_dict(), os.path.join(train_params_obj['tuned_model_path'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
 
     return np.mean(scores)
@@ -384,10 +410,10 @@ def perf_eval(model_name, trues, preds, configs=None, pred_type='regression'):
         # eval_res = pd.DataFrame(columns=cols)
 
         assert configs is not None, "Configuration is needed to evaulate Generative model"
-        trues_class = pd.Series(token2class(trues.tolist(), configs=configs))
-        if trues.shape != preds.shape:
-            preds = preds.argmax(1)
-        preds_class = pd.Series(token2class(preds.tolist(), configs=configs))
+        trues_class = pd.Series(token2class(trues.tolist(), vocabulary=configs.model.vocabulary_rev))
+        # if trues.shape != preds.shape:
+        #     preds = preds.argmax(1)
+        preds_class = pd.Series(token2class(preds.tolist(), vocabulary=configs.model.vocabulary_rev))
 
         eval_res = pd.concat([trues_class, preds_class], axis=1)
         eval_res.columns = ['Origin SEQ', 'Generated SEQ']

@@ -27,12 +27,11 @@ from sklearn.metrics import confusion_matrix
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def token2class(sequences, configs, remove_extra=True):
+def token2class(sequences, vocabulary=None, remove_extra=True):
     TOKEN_SOS = "<SOS>"
     TOKEN_PAD = "<PAD>"
     TOKEN_EOS = "<EOS>"
 
-    vocabulary = configs.model.vocabulary_rev
     assert vocabulary is not None, "Vocabulary is empty"
     if not isinstance(sequences, list):
         sequences = [sequences]
@@ -44,12 +43,12 @@ def token2class(sequences, configs, remove_extra=True):
         output = [vocabulary[token] for token in sequence]
         if remove_extra:
             if TOKEN_EOS in output:
-                output = output[1:output.index(TOKEN_EOS)]
+                output = output[:output.index(TOKEN_EOS)]
             elif TOKEN_PAD in output:
                 temp_unq = np.unique(output, return_index=True)
-                output = output[1:temp_unq[1][list(temp_unq[0]).index(TOKEN_PAD)]]
+                output = output[:temp_unq[1][list(temp_unq[0]).index(TOKEN_PAD)]]
             else:
-                output = output[1:]
+                output = output[:]
         _, unq_idx = np.unique(output, return_index=True)
         output = list(np.array(output)[np.sort(unq_idx)])
         outputs.append(output)
