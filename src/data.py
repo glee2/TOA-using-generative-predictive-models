@@ -89,7 +89,10 @@ class TechDataset(Dataset):
 
         if self.data_type == "class":
             rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','sub ipc'])[['number','main ipc','sub ipc']]
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            if self.target_ipc == "ALL":
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+            else:
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
             rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
             data = rawdata_ipc[['number']].copy(deep=True)
             assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
@@ -173,12 +176,9 @@ class TechDataset(Dataset):
                 break
 
         freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.5))[0]] # frequent words: words that appear more than 40% of the data samples
-        # rare_criterion = 5 if int(len(cleaned)*0.0005) < 10 else int(len(cleaned)*0.0005)
-        # rare_words = vocab[np.where(vocab_counts<5)[0]] # rare words: words that appear less than 2 times
         rare_words = vocab[np.where(vocab_counts<rare_criterion)[0]] # rare words: words that appear less than 0.5% of the data samples
         freq_rare_set = set(np.concatenate([freq_words, rare_words]))
         print(f"FREQ: {freq_words} ({len(freq_words)}), RARE: {rare_words} ({len(rare_words)})")
-        # cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
         cleaned = cleaned.apply(lambda x: [word for word in x if word not in freq_rare_set])
 
         return cleaned

@@ -260,6 +260,14 @@ class Decoder(nn.Module):
 
         return dec_outputs, dec_self_attn_probs, dec_enc_attn_probs
 
+class Predictor(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.device = self.config.device
+
+
+
 class Transformer(nn.Module):
     def __init__(self, config):
         super().__init__()

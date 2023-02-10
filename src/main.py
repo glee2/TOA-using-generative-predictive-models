@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.7
-Description (primary changes): Employ "Accelerator" from huggingface, to automate gpu-distributed training
+Version: 0.8
+Description (primary changes): Integrate predictor into encoder-decoder transformer model
 '''
 
 # Set root directory
@@ -220,6 +220,15 @@ if __name__=="__main__":
                     config_name += "["+str(configs[key][component])+component+"]"
             final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
+            key_components_best = {"data": ["data_type", "pred_type", "target_ipc", "ipc_level", "claim_level", "n_TC"]}
+            config_name_best = ""
+            for key in key_components_best.keys():
+                for component in key_components_best[key]:
+                    config_name_best += "["+str(configs[key][component])+component+"]"
+            best_config_path = os.path.join("./best_configs",f"[BEST_trial]{config_name_best}.pickle")
+            with open(best_config_path, "w") as f:
+                pickle.dump(configs, f)
+
         ''' PART 3-2: Dataset construction and model training '''
         ## Construct datasets
         train_idx = cv_idx[0]['train']
@@ -308,17 +317,17 @@ if __name__=="__main__":
         del converted_states
         torch.cuda.empty_cache()
 
-        data_loader = DataLoader(tech_dataset, batch_size=128)
+    data_loader = DataLoader(tech_dataset, batch_size=128)
 
-        # trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
-        trues_recon, preds_recon = validate_model(final_model, data_loader, configs.model)
+    # trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
+    trues_recon, preds_recon = validate_model(final_model, data_loader, configs.model)
 
-        eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative')
+    eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative')
 
-        BLEU_score = np.mean([sentence_bleu([x[0]], x[1]) for x in eval_recon.values])
-        print(f"BLEU scores: {np.round(BLEU_score,4)}")
+    BLEU_score = np.mean([sentence_bleu([x[0]], x[1]) for x in eval_recon.values])
+    print(f"BLEU scores: {np.round(BLEU_score,4)}")
 
-        # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
-        # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
-        # if configs.data.pred_type == "classification":
-        #     eval_y, confmat_y = eval_y
+    # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
+    # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
+    # if configs.data.pred_type == "classification":
+    #     eval_y, confmat_y = eval_y
