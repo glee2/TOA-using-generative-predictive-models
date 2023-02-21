@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.8
-Description (primary changes): Integrate predictor into encoder-decoder transformer model
+Version: 0.81
+Description (primary changes): Firstly success to train Encoder-Predictor-Decoder structure
 '''
 
 # Set root directory
@@ -26,7 +26,6 @@ from tml import utils
 from scipy import io
 from tqdm import tqdm
 from collections import OrderedDict
-from nltk.translate.bleu_score import sentence_bleu
 
 import torch
 from torch.nn import functional as F
@@ -49,7 +48,7 @@ from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
 from models import Transformer
-from train_utils import run_epoch, EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model
+from train_utils import EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model
 from utils import token2class, DotDict
 
 parser = argparse.ArgumentParser()
@@ -57,6 +56,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--data_type", type=str)
 parser.add_argument("--target_ipc", type=str)
 parser.add_argument("--pred_type", type=str)
+parser.add_argument("--use_pretrained_tokenizer", default=False, action="store_true")
 
 ## training arguments
 parser.add_argument("--do_train", default=None, action="store_true")
@@ -65,6 +65,7 @@ parser.add_argument("--learning_rate", type=float)
 parser.add_argument("--batch_size", type=int)
 parser.add_argument("--n_folds", type=int)
 parser.add_argument("--max_epochs", type=int)
+parser.add_argument("--mem_verbose", default=False, action="store_true")
 
 ## model arguments
 parser.add_argument("--use_accelerator", default=None, action="store_true")
@@ -79,6 +80,7 @@ parser.add_argument("--bidirec", default=False, action="store_true")
 ## arguments passed only for main.py
 parser.add_argument("--do_save", default=False, action="store_true")
 parser.add_argument("--light", default=False, action="store_true")
+parser.add_argument("--eval_train_set", default=False, action="store_true")
 
 if __name__=="__main__":
     ''' PART 1: Configuration '''
@@ -100,6 +102,7 @@ if __name__=="__main__":
 
     data_dir = os.path.join(root_dir, "data")
     model_dir = os.path.join(root_dir, "models")
+    result_dir = os.path.join(root_dir, "results")
 
     if configs.train.use_accelerator:
         accelerator = Accelerator()
@@ -121,7 +124,8 @@ if __name__=="__main__":
 
     configs.data.update({"root_dir": root_dir,
                             "data_dir": data_dir,
-                            "model_dir": model_dir})
+                            "model_dir": model_dir,
+                            "result_dir": result_dir})
     configs.train.update({"device": device,
                             "device_ids": device_ids,
                             "root_dir": root_dir,
@@ -148,7 +152,7 @@ if __name__=="__main__":
         n_layers = configs.model.n_layers
         d_embedding = configs.model.d_embedding
         d_hidden = configs.model.d_hidden
-        d_latent = configs.model.n_layers * configs.model.d_hidden * configs.model.n_directions
+        d_latent = configs.model.n_enc_seq * configs.model.d_hidden
 
         key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
         config_name = ""
@@ -156,9 +160,6 @@ if __name__=="__main__":
             for component in key_components[key]:
                 config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
-
-        # config_name = f"{n_layers}layers_{d_embedding}emb_{d_hidden}hid_{configs.model.n_directions}direc_{np.round(configs.train.learning_rate,4)}lr_{configs.train.batch_size}batch_{configs.train.max_epochs}ep"
-        # final_model_path = os.path.join(model_dir, f"[Final_model][{configs.data.target_ipc}]{config_name}.ckpt")
 
     configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
@@ -182,13 +183,13 @@ if __name__=="__main__":
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
-    configs.model.update({"vocabulary": tech_dataset.vocab_w2i,
-                            "vocabulary_rev": tech_dataset.vocab_i2w,
-                            "n_enc_vocab": tech_dataset.vocab_size,
-                            "n_dec_vocab": tech_dataset.vocab_size,
-                            "n_enc_seq": tech_dataset.seq_len,
-                            "n_dec_seq": tech_dataset.seq_len,
-                            "i_padding": tech_dataset.vocab_w2i["<PAD>"]})
+    configs.model.update({"tokenizer": tech_dataset.tokenizer,
+                        "n_enc_vocab": tech_dataset.tokenizer.get_vocab_size(),
+                        "n_dec_vocab": tech_dataset.tokenizer.get_vocab_size(),
+                        "n_enc_seq": tech_dataset.max_seq_len,
+                        "n_dec_seq": tech_dataset.max_seq_len,
+                        "i_padding": tech_dataset.tokenizer.token_to_id("<PAD>")})
+    # configs.model.update({"d_latent": configs.model.n_enc_seq * configs.model.d_hidden})
 
     ''' PART 3: Training '''
     if configs.train.do_train:
@@ -243,14 +244,19 @@ if __name__=="__main__":
 
         train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=0)
-        whole_loader = DataLoader(whole_dataset, batch_size=configs.train.batch_size, shuffle=False, num_workers=0)
+
+        batch_size_for_test = 128 if len(test_dataset) > 128 else len(test_dataset)
+        test_loader = DataLoader(test_dataset, batch_size=batch_size_for_test, shuffle=False, num_workers=0)
+        batch_size_for_validation = 128 if len(whole_dataset) > 128 else len(whole_dataset)
+        whole_loader = DataLoader(whole_dataset, batch_size=batch_size_for_validation, shuffle=False, num_workers=0)
 
         ## Load best model or train model
-        final_model = build_model(configs.model)
-        x_input, _ = next(iter(train_loader))
+        final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
         if re.search("^1.", torch.__version__) is not None:
-            print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
+            with torch.no_grad():
+                x_input, _ = tech_dataset.__getitem__(0)
+                x_input = torch.tensor(x_input, device=device).unsqueeze(0)
+                print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
         else:
             print("INFO: pytorch-model-summary does not support PyTorch 2.0, so just print model structure")
             print(final_model)
@@ -271,33 +277,40 @@ if __name__=="__main__":
             final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train)
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
+        torch.cuda.empty_cache()
+
         ''' PART 3-3: Training evaluation '''
-        ## Evaluation on train dataset
-        trues_recon_train, preds_recon_train = validate_model(final_model, whole_loader, configs.model)
-        # trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model)
-        eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative')
-        # eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, pred_type=configs.data.pred_type)
-        # if configs.data.pred_type == "classification":
-        #     eval_y_train, confmat_y_train = eval_y_train
+        if args.eval_train_set:
+            ## Evaluation on train dataset
+            print("Validate model on train dataset")
+            trues_recon_train, preds_recon_train, trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model, configs.train)
+            eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type)
+            if configs.data.pred_type == "classification":
+                eval_y_train, confmat_y_train = eval_y_train
+        else:
+            eval_recon_train = eval_y_train = None
 
         ## Evaluation on test dataset
-        trues_recon_test, preds_recon_test = validate_model(final_model, test_loader, configs.model)
-        # trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model)
-        eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative')
-        # eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, pred_type=configs.data.pred_type)
-        # if configs.data.pred_type == "classification":
-        #     eval_y_test, confmat_y_test = eval_y_test
+        print("Validate model on test dataset")
+        trues_recon_test, preds_recon_test, trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model, configs.train)
+        eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
+        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type)
+        if configs.data.pred_type == "classification":
+            eval_y_test, confmat_y_test = eval_y_test
 
-        # eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+        eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
         eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
-        result_path = os.path.join(root_dir, "results")
-        # with pd.ExcelWriter(os.path.join(result_path,f"[RESULT][{args.target_ipc}]{train_param_name}.xlsx")) as writer:
-        #     eval_y_res.to_excel(writer, sheet_name=args.pred_type)
-            # eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
-            # eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[TRAIN-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
+            eval_y_res.to_excel(writer, sheet_name=configs.data.pred_type)
+            if args.eval_train_set:
+                eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+            eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+        torch.cuda.empty_cache()
 
         print("Training is done!\n")
+
     else:
         final_model = build_model(configs.model)
         if os.path.exists(final_model_path):
@@ -317,17 +330,16 @@ if __name__=="__main__":
         del converted_states
         torch.cuda.empty_cache()
 
-    data_loader = DataLoader(tech_dataset, batch_size=128)
+        batch_size_for_eval = 128 if len(tech_dataset) > 128 else len(tech_dataset)
+        data_loader = DataLoader(tech_dataset, batch_size=batch_size_for_eval)
 
-    # trues_y, preds_y = validate_model(final_model, data_loader, configs.model)
-    trues_recon, preds_recon = validate_model(final_model, data_loader, configs.model)
+        trues_recon, preds_recon, trues_y, preds_y = validate_model(final_model, data_loader, configs.model, configs.train)
 
-    eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative')
+        eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative')
+        eval_y = perf_eval("LOADED_MODEL", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type)
+        if configs.data.pred_type == "classification":
+            eval_y, confmat_y = eval_y
 
-    BLEU_score = np.mean([sentence_bleu([x[0]], x[1]) for x in eval_recon.values])
-    print(f"BLEU scores: {np.round(BLEU_score,4)}")
-
-    # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, pred_type=configs.data.pred_type)
-    # eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
-    # if configs.data.pred_type == "classification":
-    #     eval_y, confmat_y = eval_y
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[LOADED-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
+            eval_y.to_excel(writer, sheet_name=configs.data.pred_type+" results")
+            eval_recon.to_excel(writer, sheet_name="Generation results")

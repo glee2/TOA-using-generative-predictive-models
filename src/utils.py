@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.1
-Description (primary changes): Util functions
+Version: 0.2
+Description (primary changes): Add DotDict, print_gpu_memcheck, unique_list_order_preserved
 '''
 
 # Set root directory
@@ -78,6 +78,11 @@ def perturbed_decode(model, enc_inputs, perturb_degree=1e-2, configs={}):
 # reference: https://mws.readthedocs.io/en/develop/_modules/mws/utils/collections.html#DotDict
 from collections.abc import Iterable, Mapping
 
+def print_gpu_memcheck(verbose, devices=[], stage="Non-specified"):
+    if verbose:
+        usages = ", ".join([f"[cuda{str(device.index)}]{str(np.round(torch.cuda.memory_allocated(device)/1024/1024, 1))}Mb" for device in devices])
+        print(f"[GPU-MEMCHECK] {stage}: {usages}")
+
 def unique_list_order_preserved(seq):
     seen = set()
     seen_add = seen.add
@@ -151,4 +156,3 @@ class NumpyJSONEncoder(json.JSONEncoder):
             return obj.tolist()
         else:
             return super(NumpyJSONEncoder, self).default(obj)
-            
