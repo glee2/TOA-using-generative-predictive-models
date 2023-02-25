@@ -1,6 +1,6 @@
 {
   "data": {"data_type": "claim",
-            "pred_type": "classification",
+            "pred_type": "regression",
             "target_ipc": "",
             "ipc_level": 3,
             "claim_level": 1,
@@ -15,7 +15,7 @@
             "n_folds": 1,
             "n_trials": 10,
             "learning_rate": 5e-4,
-            "batch_size": 512,
+            "batch_size": 128,
             "max_epochs": 50,
             "n_gpus": 4,
             "use_early_stopping": true,

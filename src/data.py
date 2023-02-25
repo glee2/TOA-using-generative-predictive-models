@@ -26,10 +26,9 @@ import sklearn
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
 from sklearn.datasets import load_digits
-from tokenizers import Tokenizer
-from tokenizers import normalizers
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
+from tokenizers import Tokenizer, normalizers, decoders
+from tokenizers.models import BPE, WordPiece
+from tokenizers.trainers import BpeTrainer, WordPieceTrainer
 from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.normalizers import NFD, Lowercase, StripAccents
 from tokenizers.processors import TemplateProcessing
@@ -54,8 +53,8 @@ class TechDataset(Dataset):
         self.data = self.preprocess()
         self.tokenizer = self.get_tokenizer()
         self.original_idx = np.array(self.data.index)
-        self.X, self.Y, self.Y_quantized = self.make_io()
-        self.n_classes = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
+        self.X, self.Y, self.Y_digitized = self.make_io()
+        self.n_outputs = len(np.unique(self.Y_digitized)) if self.pred_type == "classification" else 1
 
     def get_tokenizer(self):
         train_tokenizer = False
@@ -70,8 +69,10 @@ class TechDataset(Dataset):
             train_tokenizer = True
 
         if train_tokenizer:
-            tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
-            trainer = BpeTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"])
+            # tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
+            tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
+            # trainer = BpeTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"])
+            trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
             tokenizer.pre_tokenizer = Whitespace()
             tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
             tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
@@ -87,6 +88,8 @@ class TechDataset(Dataset):
                 tokenizer.enable_truncation(max_length=self.max_seq_len)
             tokenizer.save(tokenizer_path)
             print("Tokenizer is trained and saved")
+
+        tokenizer.decoder = decoders.WordPiece()
 
         return tokenizer
 
@@ -104,13 +107,12 @@ class TechDataset(Dataset):
         X = np.vstack(X.values)
         Y = self.data['TC'+str(self.n_TC)].values
 
-        Y_quantized = np.zeros_like(Y).astype(int)
-        Y_quantized[Y>0] = 1
+        Y_digitized = np.digitize(Y, bins=[0], right=True)
 
         if self.pred_type == "classification":
-            Y = Y_quantized
+            Y = Y_digitized
 
-        return X, Y, Y_quantized
+        return X, Y, Y_digitized
 
     def transform(self, sample):
         main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
@@ -173,9 +175,7 @@ class TechDataset(Dataset):
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify
-        # self.oversampled = oversampled
-        # self.labels = dataset.Y
-        self.labels = dataset.Y_quantized
+        self.labels = dataset.Y_digitized
         self.original_idx = dataset.original_idx
         self.dataset = dataset
         self.test_ratio = test_ratio

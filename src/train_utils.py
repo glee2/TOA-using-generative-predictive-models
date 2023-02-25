@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.6
-Description (primary changes): Firstly sucess to train Encoder-Predictor-Decoder structure
+Version: 0.61
+Description (primary changes): Adopt multiprocessing to validate_model function
 '''
 
 # Set root directory
@@ -18,6 +18,8 @@ import time
 import re
 import pandas as pd
 import numpy as np
+# import torch.multiprocessing as mp
+# mp.set_start_method("spawn")
 from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu
 
@@ -123,7 +125,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
-    loss_y = torch.nn.MSELoss()
+    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.CrossEntropyLoss()
 
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
@@ -176,6 +178,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
             if early_stopping.early_stop:
                 print("Early stopped\n")
                 break
+        torch.cuda.empty_cache()
     writer.flush()
     writer.close()
     return model
@@ -189,6 +192,7 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
 
         for i, (X, Y) in tqdm(enumerate(data_loader)):
             src, trg, y = X.to(device), X.to(device), Y.to(device)
+
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
 
             optimizer.zero_grad()
@@ -213,11 +217,11 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
             preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
             trues_recon = trg[:,1:] # omit <sos> from target sequence
             preds_y = dict_outputs["y"]
-            trues_y = y.to(dtype=preds_y[0].dtype)
+            trues_y = y.to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else y
 
             if model_params['use_predictor']:
-                loss_recon = loss_f["recon"](preds_recon, trues_recon)
-                loss_y = loss_f["y"](preds_y, trues_y)
+                loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
+                loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 loss = loss_recon + loss_y
                 dict_epoch_losses["recon"] += loss_recon.item()
                 dict_epoch_losses["y"] += loss_y.item()
@@ -271,8 +275,8 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
                 trues_y = y
 
                 if model_params['use_predictor']:
-                    loss_recon = loss_f["recon"](preds_recon, trues_recon)
-                    loss_y = loss_f["y"](preds_y, trues_y)
+                    loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
+                    loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     loss = loss_recon + loss_y
                     dict_epoch_losses["recon"] += loss_recon.item()
                     dict_epoch_losses["y"] += loss_y.item()
@@ -305,7 +309,7 @@ def validate_model(model, val_loader, model_params={}, train_params={}):
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Encoding done")
 
-            preds_recon_batch = torch.tile(torch.tensor(model.module.tokenizer.token_to_id("<SOS>"), device=model_params['device']), dims=(X_batch.shape[0],1)).to(device=model_params['device'])
+            preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=model_params['device']), dims=(X_batch.shape[0],1)).to(device=model_params['device'])
 
             pred_outputs = model.module.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
 
@@ -322,6 +326,67 @@ def validate_model(model, val_loader, model_params={}, train_params={}):
             preds_recon_val.append(preds_recon_batch[:,1:].cpu().detach().numpy()) # omit <SOS>
             preds_y_val.append(preds_y_batch)
     return [np.concatenate(x) for x in [trues_recon_val, preds_recon_val, trues_y_val, preds_y_val]]
+
+def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params={}, train_params={}):
+    if batch_size is None:
+        batch_size = train_params["batch_size"]
+    queue_dataloader = mp.Queue()
+    manager = mp.Manager()
+    ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in range(train_params["n_gpus"])})
+    processes = []
+
+    for device_rank in range(train_params["n_gpus"]):
+        model_rank = copy.deepcopy(model.module)
+        p = mp.Process(name="Subprocess", target=inference_mp, args=(model_rank, device_rank, queue_dataloader, ret_dict, model_params, train_params))
+        p.start()
+        processes.append(p)
+
+    data_loaders = [DataLoader(Subset(val_dataset, idx), batch_size=batch_size, num_workers=0) for idx in torch.arange(len(val_dataset)).chunk(train_params["n_gpus"])]
+
+    for rank in range(train_params["n_gpus"]):
+        queue_dataloader.put(data_loaders[rank])
+
+    for p in processes:
+        p.join()
+
+    return ret_dict
+
+def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, train_params):
+    import torch
+    import numpy as np
+    from tqdm import tqdm
+    curr_device = torch.device(f"cuda:{device_rank}")
+    model = model.to(device=curr_device)
+    with torch.no_grad():
+        data_loader = queue_dataloader.get()
+        trues_recon, trues_y = [], []
+        preds_recon, preds_y = [], []
+
+        for batch, (X_batch, Y_batch) in tqdm(enumerate(data_loader)):
+            trues_recon.append(X_batch[:,1:].cpu().detach().numpy())
+            trues_y.append(Y_batch.cpu().detach().numpy())
+
+            enc_inputs = X_batch.to(device=curr_device)
+            enc_outputs, *_ = model.encoder(enc_inputs)
+
+            preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(X_batch.shape[0],1)).to(device=curr_device)
+            preds_y_batch = model.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
+
+            for i in range(model_params['n_dec_seq']-1):
+                dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs, enc_outputs)
+                pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
+                preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
+
+            preds_recon.append(preds_recon_batch[:,1:].cpu().detach().numpy())
+            preds_y.append(preds_y_batch.cpu().detach().numpy())
+
+        trues_recon = np.concatenate(trues_recon)
+        trues_y = np.concatenate(trues_y)
+        preds_recon = np.concatenate(preds_recon)
+        preds_y = np.concatenate(preds_y)
+
+        ret_dict[device_rank]["recon"] = {"true": trues_recon, "pred": preds_recon} # omit <SOS>
+        ret_dict[device_rank]["y"] = {"true": trues_y, "pred": preds_y}
 
 def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
@@ -363,11 +428,12 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
     best_model = trained_models[np.argmin(scores)].module
     torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_dir'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
+    torch.cuda.empty_cache()
 
     return np.mean(scores)
 
 def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', tokenizer=None):
-    if pred_type == 'classification_binary':
+    if pred_type == 'classification':
         metric_list = ['Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
         preds_binary = preds.argmax(1)
 
@@ -401,7 +467,7 @@ def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', to
         assert tokenizer is not None, "Tokenizer is needed to convert ids to tokens"
 
         trues_claims = pd.Series(tokenizer.decode_batch(trues))
-        preds_claims = pd.Series(tokenizer.decode_batch(preds))
+        preds_claims = pd.Series(tokenizer.decode_batch(preds, skip_special_tokens=False)).apply(lambda x: x.split("<EOS>")[0])
         BLEU_scores = pd.Series([sentence_bleu([t],p) for t,p in zip(trues_claims.values, preds_claims.values)])
 
         eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)
