@@ -114,8 +114,13 @@ if __name__=="__main__":
     elif len(configs.data.target_ipc) > 5:
         configs.data.update({"target_ipc": configs.data.target_ipc[:4]})
 
-    configs.train.loss_weights["recon"] = configs.train.loss_weights["recon"] / sum(configs.train.loss_weights.values())
-    configs.train.loss_weights["y"] = 1 - configs.train.loss_weights["recon"]
+    if configs.model.model_type == "enc-pred-dec":
+        configs.train.loss_weights["recon"] = configs.train.loss_weights["recon"] / sum(configs.train.loss_weights.values())
+        configs.train.loss_weights["y"] = 1 - configs.train.loss_weights["recon"]
+    elif configs.model.model_type == "enc-pred":
+        configs.train.loss_weights = {"recon": 0, "y": 1}
+    elif configs.model.model_type == "enc-dec":
+        configs.train.loss_weights = {"recon": 1, "y": 0}
 
     if configs.train.use_accelerator:
         accelerator = Accelerator()
@@ -130,6 +135,7 @@ if __name__=="__main__":
             device_ids = np.argsort(gpu_usages)[:configs.train.n_gpus]
             device_ids = list(map(lambda x: torch.device('cuda', x),list(device_ids)))
             device = device_ids[0] # main device
+            torch.cuda.set_device(device)
         else:
             device = torch.device('cpu')
             device_ids = []
@@ -206,7 +212,7 @@ if __name__=="__main__":
 
     ''' PART 3: Training '''
     if configs.train.do_train:
-        sampler = CVSampler(tech_dataset, n_folds=configs.train.n_folds, test_ratio=0.3, stratify=True)
+        sampler = CVSampler(tech_dataset, n_folds=configs.train.n_folds, test_ratio=0.1, stratify=True)
         cv_idx = sampler.get_idx_dict()
         print(f"#Samples\nTrain: {len(cv_idx[0]['train'])}, Validation: {len(cv_idx[0]['val'])}, Test: {len(cv_idx[0]['test'])}")
 
@@ -223,6 +229,7 @@ if __name__=="__main__":
             print(f"Best trial:\n  CrossEntropyLoss: {study.best_trial.value}\n  Params:")
             for k, v in best_params.items():
                 print(f"    {k}: {v}")
+                if isinstance(v, np.int64): best_params[k] = int(v)
 
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
             configs.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
@@ -239,9 +246,10 @@ if __name__=="__main__":
             for key in key_components_best.keys():
                 for component in key_components_best[key]:
                     config_name_best += "["+str(configs[key][component])+component+"]"
-            best_config_path = os.path.join("./best_configs",f"[BEST_trial]{config_name_best}.pickle")
-            with open(best_config_path, "w") as f:
-                pickle.dump(configs, f)
+            configs_to_save = {configkey: {key: configs[configkey][key] for key in org_config_keys[configkey]} for configkey in org_config_keys}
+            best_config_path = f"[BEST_trial]{config_name_best}.json"
+            with open(os.path.join(config_dir, "best_hparam", best_config_path), "w") as f:
+                json.dump(configs_to_save, f, indent=4)
 
         ''' PART 3-2: Dataset construction and model training '''
         ## Construct datasets
@@ -277,7 +285,7 @@ if __name__=="__main__":
             torch._dynamo.config.suppress_errors = True
 
         if configs.train.do_tune:
-            best_states = torch.load(os.path.join(configs.train.tuned_model_path,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
+            best_states = torch.load(os.path.join(configs.train.model_dir,f"[HPARAM_TUNING]{study.best_trial.number}trial.ckpt"))
             converted_states = OrderedDict()
             for k, v in best_states.items():
                 if 'module' not in k:
@@ -297,7 +305,7 @@ if __name__=="__main__":
             ## Evaluation on train dataset
             print("Validate model on train dataset")
             # trues_recon_train, preds_recon_train, trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model, configs.train)
-            val_res_train = validate_model_mp(final_model, whole_dataset, model_params=configs.model, train_params=configs.train)
+            val_res_train = validate_model_mp(final_model, whole_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
             trues_recon_train = np.concatenate([res["recon"]["true"] for res in val_res_train.values()])
             preds_recon_train = np.concatenate([res["recon"]["pred"] for res in val_res_train.values()])
             trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
@@ -314,7 +322,7 @@ if __name__=="__main__":
         ## Evaluation on test dataset
         print("Validate model on test dataset")
         # trues_recon_test, preds_recon_test, trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model, configs.train)
-        val_res_test = validate_model_mp(final_model, test_dataset, model_params=configs.model, train_params=configs.train)
+        val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
         trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
         preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
         trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
@@ -364,7 +372,7 @@ if __name__=="__main__":
         instant_dataset = Subset(tech_dataset, np.random.choice(np.arange(len(tech_dataset)), 1000))
         data_loader = DataLoader(instant_dataset, batch_size=128)
 
-        val_res = validate_model_mp(final_model, instant_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
+        val_res = validate_model_mp(final_model, instant_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
         trues_recon = np.concatenate([res["recon"]["true"] for res in val_res.values()])
         preds_recon = np.concatenate([res["recon"]["pred"] for res in val_res.values()])
         trues_y = np.concatenate([res["y"]["true"] for res in val_res.values()])

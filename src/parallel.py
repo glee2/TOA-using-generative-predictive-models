@@ -60,6 +60,9 @@ class Reduce(Function):
 
     @staticmethod
     def backward(ctx, gradOutput):
+        # print(type(gradOutput))
+        # print(gradOutput.shape)
+        # print(gradOutput.device)
         return Broadcast.apply(ctx.target_gpus, gradOutput)
 
 

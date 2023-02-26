@@ -266,7 +266,9 @@ class Predictor(nn.Module):
         self.config = config
         self.device = self.config.device
 
-        self.layers = self.set_layers(self.config.d_latent, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+        self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
+        # self.layers = self.set_layers(self.config.d_latent, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+        self.layers = self.set_layers(self.config.d_hidden, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
         self.relu = nn.ReLU()
 
     def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
@@ -291,7 +293,9 @@ class Predictor(nn.Module):
     def forward(self, x):
         # x (enc_outputs): (batch_size, n_enc_seq, d_hidden)
         batch_size = x.size(0)
-        x = x.view(batch_size, -1) # Flatten input
+        attn_weighted = self.attn_weight(x)
+        x = torch.bmm(attn_weighted.transpose(-1,1), x).squeeze()
+        # x = x.view(batch_size, -1) # Flatten input
         for layer in self.layers:
             x = layer(x)
         out = x

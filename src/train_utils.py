@@ -130,10 +130,19 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
 
-    if model_params['use_predictor']:
+    # if model_params['use_predictor']:
+    if model_params["model_type"] == "enc-pred-dec":
         loss_f = {"recon": loss_recon, "y": loss_y}
-    else:
+    elif model_params["model_type"] == "enc-dec":
         loss_f = {"recon": loss_recon}
+        for p in model.module.predictor.parameters():
+            p.requires_grad = False
+    elif model_params["model_type"] == "enc-pred":
+        loss_f = {"y": loss_y}
+        for p in model.module.decoder.parameters():
+            p.requires_grad = False
+    else:
+        loss_f = None
 
     if trial is not None:
         train_params['learning_rate'] = trial.suggest_float("learning_rate", 1e-5, 1e-1, log=True)
@@ -144,7 +153,8 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         max_epochs = train_params['max_epochs']
         early_stop_patience = train_params['early_stop_patience']
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=train_params['learning_rate'])
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=train_params['learning_rate'])
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=train_params['learning_rate'])
 
     ## Accelerator wrapping
     if train_params['use_accelerator']:
@@ -159,7 +169,18 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     for ep in range(max_epochs):
         epoch_start = time.time()
         print(f"Epoch {ep+1}\n"+str("-"*25))
-        train_loss = run_epoch(train_loader, model, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
+
+        if train_params["alternate_train"]:
+            if ep < 10:
+                for p in model.module.decoder.parameters():
+                    p.requires_grad = False
+            elif ep == 11:
+                for p in model.module.decoder.parameters():
+                    p.requires_grad = True
+                for p in model.module.decoder.pos_emb.parameters():
+                    p.requires_grad = False
+
+        train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
         val_loss = run_epoch(val_loader, model, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
         epoch_end = time.time()
         epoch_mins, epoch_secs = epoch_time(epoch_start, epoch_end)
@@ -183,7 +204,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     writer.close()
     return model
 
-def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', train_params={}, model_params={}):
+def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode='train', train_params={}, model_params={}):
     device = train_params['device']
     clip_max_norm = 1
     if mode=="train":
@@ -219,13 +240,24 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
             preds_y = dict_outputs["y"]
             trues_y = y.to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else y
 
-            if model_params['use_predictor']:
+            # if model_params['use_predictor']:
+            if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
-                loss = loss_recon + loss_y
+                if train_params["alternate_train"]:
+                    if epoch < 10:
+                        loss = loss_y
+                    else:
+                        loss = loss_recon + loss_y
+                else:
+                    loss = loss_recon + loss_y
                 dict_epoch_losses["recon"] += loss_recon.item()
                 dict_epoch_losses["y"] += loss_y.item()
-            else:
+            elif model_params["model_type"] == "enc-pred":
+                loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
+                loss = loss_y
+                dict_epoch_losses["y"] += loss_y.item()
+            elif model_params["model_type"] == "enc-recon":
                 loss_recon = loss_f["recon"](preds_recon, trues_recon)
                 loss = loss_recon
                 dict_epoch_losses["recon"] += loss_recon.item()
@@ -240,6 +272,7 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Backward propagation")
 
             nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
+
             optimizer.step()
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Weight update")
@@ -274,13 +307,23 @@ def run_epoch(data_loader, model, loss_f=None, optimizer=None, mode='train', tra
                 preds_y = dict_outputs["y"]
                 trues_y = y
 
-                if model_params['use_predictor']:
+                if model_params["model_type"] == "enc-pred-dec":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
-                    loss = loss_recon + loss_y
+                    if train_params["alternate_train"]:
+                        if epoch < 10:
+                            loss = loss_y
+                        else:
+                            loss = loss_recon + loss_y
+                    else:
+                        loss = loss_recon + loss_y
                     dict_epoch_losses["recon"] += loss_recon.item()
                     dict_epoch_losses["y"] += loss_y.item()
-                else:
+                elif model_params["model_type"] == "enc-pred":
+                    loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
+                    loss = loss_y
+                    dict_epoch_losses["y"] += loss_y.item()
+                elif model_params["model_type"] == "enc-recon":
                     loss_recon = loss_f["recon"](preds_recon, trues_recon)
                     loss = loss_recon
                     dict_epoch_losses["recon"] += loss_recon.item()
