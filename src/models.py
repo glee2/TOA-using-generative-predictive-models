@@ -310,13 +310,19 @@ class Transformer(nn.Module):
         self.tokenizer = tokenizer
 
         self.encoder = Encoder(self.config)
-        self.predictor = Predictor(self.config)
-        self.decoder = Decoder(self.config)
+        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
+        self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
 
     def forward(self, enc_inputs, dec_inputs):
         # enc_inputs: (batch_size, n_enc_seq), dec_inputs: (batch_size, n_dec_seq)
         enc_outputs, enc_self_attn_probs = self.encoder(enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
-        pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
-        dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs, enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        if self.predictor is not None:
+            pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
+        else:
+            pred_outputs = None
+        if self.decoder is not None:
+            dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs, enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        else:
+            dec_outputs = dec_self_attn_probs = dec_enc_attn_probs = None
 
         return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs, enc_outputs, pred_outputs

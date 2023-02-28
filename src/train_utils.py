@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.61
-Description (primary changes): Adopt multiprocessing to validate_model function
+Version: 0.62
+Description (primary changes): Modify classification task
 '''
 
 # Set root directory
@@ -130,17 +130,16 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
 
-    # if model_params['use_predictor']:
     if model_params["model_type"] == "enc-pred-dec":
         loss_f = {"recon": loss_recon, "y": loss_y}
     elif model_params["model_type"] == "enc-dec":
         loss_f = {"recon": loss_recon}
-        for p in model.module.predictor.parameters():
-            p.requires_grad = False
+        # for p in model.module.predictor.parameters():
+        #     p.requires_grad = False
     elif model_params["model_type"] == "enc-pred":
         loss_f = {"y": loss_y}
-        for p in model.module.decoder.parameters():
-            p.requires_grad = False
+        # for p in model.module.decoder.parameters():
+        #     p.requires_grad = False
     else:
         loss_f = None
 
@@ -171,21 +170,23 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         print(f"Epoch {ep+1}\n"+str("-"*25))
 
         if train_params["alternate_train"]:
-            if ep < 10:
+            if ep % 2 == 0:
                 for p in model.module.decoder.parameters():
                     p.requires_grad = False
-            elif ep == 11:
+            else:
                 for p in model.module.decoder.parameters():
                     p.requires_grad = True
                 for p in model.module.decoder.pos_emb.parameters():
                     p.requires_grad = False
+                # for p in model.module.predictor.parameters():
+                #     p.requires_grad = False
 
         train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
-        val_loss = run_epoch(val_loader, model, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
+        val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
         epoch_end = time.time()
         epoch_mins, epoch_secs = epoch_time(epoch_start, epoch_end)
         print(f'Epoch: {ep + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
-        print(f"Avg train loss: {train_loss['total']:>5f}, Avg val loss: {val_loss['total']:>5f} (recon loss: {val_loss['recon']:>5f}, y loss: {val_loss['y']:>5f})\n")
+        print(f"Avg train loss: {train_loss['total']:>5f} (recon loss: {train_loss['recon']:>5f}, y loss: {train_loss['y']:>5f})\nAvg val loss: {val_loss['total']:>5f} (recon loss: {val_loss['recon']:>5f}, y loss: {val_loss['y']:>5f})\n")
 
         writer.add_scalar("Loss/train[total]", train_loss["total"], ep)
         writer.add_scalar("Loss/train[recon]", train_loss["recon"], ep)
@@ -235,17 +236,18 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Forward pass")
 
-            preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
-            trues_recon = trg[:,1:] # omit <sos> from target sequence
-            preds_y = dict_outputs["y"]
-            trues_y = y.to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else y
+            if "dec" in model_params["model_type"]:
+                preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
+                trues_recon = trg[:,1:] # omit <sos> from target sequence
+            if "pred" in model_params["model_type"]:
+                preds_y = dict_outputs["y"]
+                trues_y = y.to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else y
 
-            # if model_params['use_predictor']:
             if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch < 10:
+                    if epoch % 2 == 0:
                         loss = loss_y
                     else:
                         loss = loss_recon + loss_y
@@ -302,16 +304,18 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 outputs_y = [output[-1] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
                 dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
 
-                preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
-                trues_recon = trg[:,1:] # omit <sos> from target sequence
-                preds_y = dict_outputs["y"]
-                trues_y = y
+                if "dec" in model_params["model_type"]:
+                    preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
+                    trues_recon = trg[:,1:] # omit <sos> from target sequence
+                if "pred" in model_params["model_type"]:
+                    preds_y = dict_outputs["y"]
+                    trues_y = y
 
                 if model_params["model_type"] == "enc-pred-dec":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
-                        if epoch < 10:
+                        if epoch % 2 == 0:
                             loss = loss_y
                         else:
                             loss = loss_recon + loss_y
@@ -477,22 +481,37 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
 def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', tokenizer=None):
     if pred_type == 'classification':
-        metric_list = ['Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
-        preds_binary = preds.argmax(1)
+        if trues.shape != preds.shape:
+            preds = preds.argmax(-1)
+        metric_list = ['Support', 'Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
 
-        conf_mat = confusion_matrix(trues, preds_binary)
-        tn, fp, fn, tp = conf_mat.ravel()
+        cm = confusion_matrix(trues, preds)
 
-        acc = (tn+tp)/conf_mat.sum()
-        rec = tp/(tp+fn)
-        pre = tp/(tp+fp)
-        spe = tn/(tn+fp)
-        npv = tn/(tn+fn)
-        f1 = 2*((pre*rec)/(pre+rec))
+        metric_dict = {}
+        for c in range(configs.model.n_outputs):
+            res = decom_confmat(cm, c=c)
+            metric_dict[c] = res
+        cm_micro = np.array([np.sum([metric_dict[c]["components"][comp] for c in metric_dict.keys()]) for comp in ["tp","fn","fp","tn"]]).reshape(2,2)
+        res_micro = {k: v for k, v in decom_confmat(cm_micro, c=0).items() if k not in ["components"]}
+        res_macro = {metric: np.mean([metric_dict[c][metric] for c in metric_dict.keys()]) for metric in metric_list[1:]}
+        res_macro["Support"] = res_micro["Support"]
+        res_weighted = {metric: np.sum([metric_dict[c][metric]*metric_dict[c]["Support"] for c in metric_dict.keys()])/cm.sum() for metric in metric_list[1:]}
+        res_weighted["Support"] = res_micro["Support"]
+        metric_dict.update({"micro-averaged": res_micro, "macro-averaged": res_macro, "weighted-averaged": res_weighted})
 
-        eval_res = pd.DataFrame([[model_name,len(trues),acc,rec,pre,f1,spe,npv]], columns=['Model','Support']+metric_list).set_index('Model').apply(np.round, axis=0, decimals=4)
+        eval_res = pd.DataFrame.from_dict(metric_dict).T
+        eval_res = eval_res[[c for c in eval_res.columns if c!="components"]]
+        eval_res = eval_res.apply(lambda x: x.apply(lambda xx: np.round(xx,4)), axis=1)
 
-        return (eval_res, conf_mat)
+        df_model_name = pd.DataFrame(np.tile([""], len(eval_res.columns))[np.newaxis,:], index=[model_name], columns=eval_res.columns)
+        eval_res = pd.concat([df_model_name, eval_res])
+
+        conf_mat_res = conf_mat_res = pd.DataFrame(cm, index=["True "+str(i) for i in range(configs.model.n_outputs)], columns=["Predicted "+str(i) for i in range(configs.model.n_outputs)])
+        df_model_name = pd.DataFrame(np.tile([""], len(conf_mat_res.columns))[np.newaxis,:], index=[model_name], columns=conf_mat_res.columns)
+        conf_mat_res = pd.concat([df_model_name, conf_mat_res])
+
+        return (eval_res, conf_mat_res)
+
     elif pred_type == 'regression':
         metric_list = ['MAE', 'MAPE', 'MSE', 'RMSE', 'R2']
 
@@ -521,6 +540,31 @@ def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', to
     else:
         print(f"Not implemented for {pred_type} type.")
         return
+
+def decom_confmat(cm, c=None):
+    n_outputs = len(cm)
+    tp = cm[c,c]
+
+    tn_idx = (np.repeat(np.arange(n_outputs)[np.arange(n_outputs)!=c], n_outputs-1).tolist(), np.tile(np.arange(n_outputs)[np.arange(n_outputs)!=c], n_outputs-1).tolist())
+    tn = cm[tn_idx].sum()
+
+    fn_idx = (np.repeat([c], n_outputs-1), np.arange(n_outputs)[np.arange(n_outputs)!=c])
+    fn = cm[fn_idx].sum()
+
+    fp_idx = (np.arange(n_outputs)[np.arange(n_outputs)!=c], np.repeat([c], n_outputs-1))
+    fp = cm[fp_idx].sum()
+
+    sup = np.sum(cm[c,:])
+    acc = (tn+tp)/cm.sum()
+    pre = tp/(tp+fp)
+    rec = tp/(tp+fn)
+    spe = tn/(tn+fp)
+    npv = tn/(tn+fn)
+    f1 = 2*((pre*rec)/(pre+rec))
+
+    output_dict = {"Support": sup, "Accuracy": acc, "Precision": pre, "Recall": rec, "F1 score": f1, "Specificity": spe, "NPV": npv, "components": {"tp": tp, "tn": tn, "fp": fp, "fn": fn}}
+
+    return output_dict
 
 '''
 [REFERENCE]

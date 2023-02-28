@@ -2,7 +2,7 @@
 '''
 Author: Gyumin Lee
 Version: 0.82
-Description (primary changes): Adopt multiprocessing to validate_model function
+Description (primary changes): Modify classification task
 '''
 
 # Set root directory
@@ -46,7 +46,7 @@ import pandas as pd
 import scipy.stats
 import sklearn
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix
+from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
@@ -304,7 +304,6 @@ if __name__=="__main__":
         if args.eval_train_set:
             ## Evaluation on train dataset
             print("Validate model on train dataset")
-            # trues_recon_train, preds_recon_train, trues_y_train, preds_y_train = validate_model(final_model, whole_loader, configs.model, configs.train)
             val_res_train = validate_model_mp(final_model, whole_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
             trues_recon_train = np.concatenate([res["recon"]["true"] for res in val_res_train.values()])
             preds_recon_train = np.concatenate([res["recon"]["pred"] for res in val_res_train.values()])
@@ -317,11 +316,10 @@ if __name__=="__main__":
             if configs.data.pred_type == "classification":
                 eval_y_train, confmat_y_train = eval_y_train
         else:
-            eval_recon_train = eval_y_train = None
+            eval_recon_train = eval_y_train = confmat_y_train = None
 
         ## Evaluation on test dataset
         print("Validate model on test dataset")
-        # trues_recon_test, preds_recon_test, trues_y_test, preds_y_test = validate_model(final_model, test_loader, configs.model, configs.train)
         val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
         trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
         preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
@@ -333,11 +331,15 @@ if __name__=="__main__":
         if configs.data.pred_type == "classification":
             eval_y_test, confmat_y_test = eval_y_test
 
-        eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
         eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
+        eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+        if configs.data.pred_type == "classification":
+            confmat_y_res = pd.concat([confmat_y_train, confmat_y_test], axis=0)
 
         with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[TRAIN-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
-            eval_y_res.to_excel(writer, sheet_name=configs.data.pred_type)
+            eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
+            if configs.data.pred_type == "classification":
+                confmat_y_res.to_excel(writer, sheet_name="Confusion_matrix")
             if args.eval_train_set:
                 eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
             eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")

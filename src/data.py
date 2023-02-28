@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.7
-Description (primary changes): Use pre-trained Tokenizer
+Version: 0.71
+Description (primary changes): Modify classification task
 '''
 
 # Set root directory
@@ -107,7 +107,8 @@ class TechDataset(Dataset):
         X = np.vstack(X.values)
         Y = self.data['TC'+str(self.n_TC)].values
 
-        Y_digitized = np.digitize(Y, bins=[0], right=True)
+        bins_criterion = {3: [0], 5: [0], 7: [0,2], 10: [0,4]}
+        Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
 
         if self.pred_type == "classification":
             Y = Y_digitized
