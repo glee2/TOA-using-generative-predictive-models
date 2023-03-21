@@ -275,14 +275,14 @@ class Predictor(nn.Module):
         layers = [
             nn.Sequential(
                 nn.Linear(d_input, d_hidden),
-                nn.LeakyReLU()
+                nn.ReLU()
             )
         ]
         for _ in range(n_layers-1):
             layers.append(
                 nn.Sequential(
                     nn.Linear(d_hidden, d_hidden),
-                    nn.LeakyReLU()
+                    nn.ReLU()
                 )
             )
         layers.append(nn.Sequential(nn.Linear(d_hidden, n_outputs)))

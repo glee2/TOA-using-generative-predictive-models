@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.71
-Description (primary changes): Modify classification task
+Version: 0.72
+Description (primary changes): Apply [keywords input - Full text output] scheme
 '''
 
 # Set root directory
@@ -14,6 +14,8 @@ sys.path.append(root_dir)
 import os
 import copy
 import re
+import time
+import datetime
 import pandas as pd
 import numpy as np
 
@@ -49,11 +51,11 @@ class TechDataset(Dataset):
         for key, value in config.items():
             setattr(self, key, value)
 
-        self.rawdata = pd.read_csv(os.path.join(config.data_dir, "collection_final_with_claims.csv"))
+        self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
         self.data = self.preprocess()
         self.tokenizer = self.get_tokenizer()
         self.original_idx = np.array(self.data.index)
-        self.X, self.Y, self.Y_digitized = self.make_io()
+        self.X, self.X_keywords, self.Y, self.Y_digitized = self.make_io()
         self.n_outputs = len(np.unique(self.Y_digitized)) if self.pred_type == "classification" else 1
 
     def get_tokenizer(self):
@@ -102,9 +104,13 @@ class TechDataset(Dataset):
             X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
         elif self.data_type == "claim":
             tokenized_outputs = self.tokenizer.encode_batch(self.data['claims'])
-            X = pd.Series([output.ids for output in tokenized_outputs])
+            X = np.vstack([output.ids for output in tokenized_outputs])
 
-        X = np.vstack(X.values)
+            claim_keywords = self.extract_keywords(self.data['claims'].tolist())
+            tokenized_outputs_keywords = self.tokenizer.encode_batch(claim_keywords)
+            X_keywords = np.vstack([output.ids for output in tokenized_outputs_keywords])
+
+        # X = np.vstack(X.values)
         Y = self.data['TC'+str(self.n_TC)].values
 
         bins_criterion = {3: [0], 5: [0], 7: [0,2], 10: [0,4]}
@@ -113,7 +119,23 @@ class TechDataset(Dataset):
         if self.pred_type == "classification":
             Y = Y_digitized
 
-        return X, Y, Y_digitized
+        return X, X_keywords, Y, Y_digitized
+
+    def extract_keywords(self, claims):
+        cleaner = CleanTransformer(
+                    lower=True, no_line_breaks=True, normalize_whitespace=True,
+                    no_punct=True, replace_with_punct="", strip_lines=True,
+                    no_currency_symbols=True, replace_with_currency_symbol="",
+                    no_numbers=False, replace_with_number="",
+                    no_digits=False, replace_with_digit="")
+        stop_words = stopwords.words("english")
+        # cleaned = ["".join(claim.split(":")[1:]) for claim in claims]
+        cleaned = [re.sub("([-=+,#/\?:^.@*\"※~ㆍ!』‘|\(\)\[\]`\'…》\”\“\’·(\\n)])", " ", claim) for claim in claims]
+        cleaned = cleaner.transform(cleaned)
+        cleaned = [re.sub("(?<!\S)\d+(?!\S)", " ", claim).split() for claim in cleaned] # Also, remove standalone numbers
+        cleaned = [" ".join([word for word in claim if word not in stop_words + ["the"]]) for claim in cleaned]
+
+        return cleaned
 
     def transform(self, sample):
         main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
@@ -123,7 +145,8 @@ class TechDataset(Dataset):
 
     def preprocess(self):
         regex = re.compile("[0-9a-zA-Z\/]+")
-        cols_year = ['<1976']+list(np.arange(1976,2018).astype(str))
+        latest_year = datetime.datetime.now().year-1
+        cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
         if self.data_type == "class":
             rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','sub ipc'])[['number','main ipc','sub ipc']]
@@ -146,19 +169,24 @@ class TechDataset(Dataset):
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
         elif self.data_type == "claim":
             claim_separator = "\n\n\n"
-            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','claims']]
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','sub ipc','claims']]
             if self.target_ipc == "ALL":
                 main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
             else:
-                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+                # main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+                ## temporarily
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
             assert len(main_ipcs) != 0, "target ipc is not observed"
             data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
 
             if self.claim_level != -1:
                 data['claims'] = data['claims'].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
 
-        rawdata_tc = self.rawdata.loc[data.index][['year']+cols_year]
-        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year']+1 if x['year']<2017 else 2017, x['year']+self.n_TC+1 if x['year']+self.n_TC<2018 else 2018).astype(str)].sum(), axis=1)
+        rawdata_tc = self.rawdata.loc[data.index]#[['year']+cols_year]
+        # data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year'] if x['year']<2017 else 2017, x['year']+self.n_TC+1 if x['year']+self.n_TC<2018 else 2018).astype(str)].sum(), axis=1)
+
+        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
+
         data = data.set_index('number')
 
         return data
@@ -171,6 +199,9 @@ class TechDataset(Dataset):
             X, Y = self.transform(self.data.iloc[idx])
         else:
             X, Y = self.X[idx], self.Y[idx]
+            if self.use_keywords:
+                X_keywords = self.X_keywords[idx]
+                return X, X_keywords, Y
         return X, Y
 
 class CVSampler:

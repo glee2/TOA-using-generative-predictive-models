@@ -1,5 +1,6 @@
 {
   "data": {"data_type": "claim",
+            "data_file": "collection_final_with_claims.csv",
             "pred_type": "regression",
             "target_ipc": "",
             "ipc_level": 3,

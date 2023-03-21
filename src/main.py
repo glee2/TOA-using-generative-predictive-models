@@ -13,6 +13,7 @@ sys.path.append(root_dir)
 import copy
 import gc
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
 import math
 import time
@@ -78,6 +79,7 @@ parser.add_argument("--d_hidden", type=int)
 parser.add_argument("--d_ff", type=int)
 parser.add_argument("--n_head", type=int)
 parser.add_argument("--d_head", type=int)
+parser.add_argument("--model_type", type=str)
 parser.add_argument("--bidirec", default=False, action="store_true")
 
 ## arguments passed only for main.py
@@ -149,6 +151,7 @@ if __name__=="__main__":
                             "root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir,
+                            "use_keywords": configs.data.use_keywords,
                             "early_stop_patience": int(0.3*configs.train.max_epochs)})
     configs.model.update({"device": device,
                             "device_ids": device_ids,
@@ -275,7 +278,10 @@ if __name__=="__main__":
         final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
         if re.search("^1.", torch.__version__) is not None:
             with torch.no_grad():
-                x_input, _ = tech_dataset.__getitem__(0)
+                if configs.data.use_keywords:
+                    x_input, x_keywords_input, _ = tech_dataset.__getitem__(0)
+                else:
+                    x_input, _ = tech_dataset.__getitem__(0)
                 x_input = torch.tensor(x_input, device=device).unsqueeze(0)
                 print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
         else:
@@ -300,6 +306,8 @@ if __name__=="__main__":
 
         torch.cuda.empty_cache()
 
+        print("Training is done!\n")
+
         ''' PART 3-3: Training evaluation '''
         if args.eval_train_set:
             ## Evaluation on train dataset
@@ -311,7 +319,7 @@ if __name__=="__main__":
             preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
 
             eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
-            eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
+            # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
             eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type)
             if configs.data.pred_type == "classification":
                 eval_y_train, confmat_y_train = eval_y_train
@@ -321,31 +329,33 @@ if __name__=="__main__":
         ## Evaluation on test dataset
         print("Validate model on test dataset")
         val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
-        trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
-        preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
-        trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
-        preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
+        if "pred" in configs.model.model_type:
+            trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
+            preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
+            eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type)
+            if configs.data.pred_type == "classification":
+                eval_y_test, confmat_y_test = eval_y_test
+            eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+            if configs.data.pred_type == "classification":
+                confmat_y_res = pd.concat([confmat_y_train, confmat_y_test], axis=0)
 
-        eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
-        eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type)
-        if configs.data.pred_type == "classification":
-            eval_y_test, confmat_y_test = eval_y_test
-
-        eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
-        eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
-        if configs.data.pred_type == "classification":
-            confmat_y_res = pd.concat([confmat_y_train, confmat_y_test], axis=0)
+        if "dec" in configs.model.model_type:
+            trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
+            preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
+            eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
         with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[TRAIN-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
-            eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
-            if configs.data.pred_type == "classification":
-                confmat_y_res.to_excel(writer, sheet_name="Confusion_matrix")
-            if args.eval_train_set:
-                eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
-            eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
-        torch.cuda.empty_cache()
+            if "pred" in configs.model.model_type:
+                eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
+                if configs.data.pred_type == "classification":
+                    confmat_y_res.to_excel(writer, sheet_name="Confusion_matrix")
+            if "dec" in configs.model.model_type:
+                if args.eval_train_set:
+                    eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+                eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
 
-        print("Training is done!\n")
+        torch.cuda.empty_cache()
 
         configs_to_save = {configkey: {key: configs[configkey][key] for key in org_config_keys[configkey]} for configkey in org_config_keys}
         fname_config_to_save = "[CONFIGS]"+datetime.datetime.now().strftime("%Y-%m-%d_%H:%M")+".json"
