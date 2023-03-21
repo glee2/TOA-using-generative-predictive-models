@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.72
-Description (primary changes): Apply [keywords input - Full text output] scheme
+Version: 0.8
+Description (primary changes): Use pre-trained models
 '''
 
 # Set root directory
@@ -28,6 +28,7 @@ import sklearn
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
 from sklearn.datasets import load_digits
+from transformers import DistilBertTokenizer
 from tokenizers import Tokenizer, normalizers, decoders
 from tokenizers.models import BPE, WordPiece
 from tokenizers.trainers import BpeTrainer, WordPieceTrainer
@@ -53,73 +54,103 @@ class TechDataset(Dataset):
 
         self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
         self.data = self.preprocess()
-        self.tokenizer = self.get_tokenizer()
+        # self.tokenizer = self.get_tokenizer()
+        self.tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
         self.original_idx = np.array(self.data.index)
-        self.X, self.X_keywords, self.Y, self.Y_digitized = self.make_io()
-        self.n_outputs = len(np.unique(self.Y_digitized)) if self.pred_type == "classification" else 1
+        # self.X, self.X_keywords, self.Y, self.Y_digitized = self.make_io()
+        self.claim_keywords, self.TCs, self.TCs_digitized = self.make_io()
+        self.n_outputs = len(np.unique(self.TCs_digitized)) if self.pred_type == "classification" else 1
+    #
+    # def get_tokenizer(self):
+    #     train_tokenizer = False
+    #     tokenizer_path = os.path.join(self.data_dir, f"tokenizer_vocab[{self.vocab_size}].json")
+    #     if self.use_pretrained_tokenizer:
+    #         if os.path.exists(tokenizer_path):
+    #             tokenizer = Tokenizer.from_file(tokenizer_path)
+    #         else:
+    #             print("Pretrained tokenizer file is not found, train new tokenizer")
+    #             train_tokenizer = True
+    #     else:
+    #         train_tokenizer = True
+    #
+    #     if train_tokenizer:
+    #         # tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
+    #         tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
+    #         # trainer = BpeTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"])
+    #         trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
+    #         tokenizer.pre_tokenizer = Whitespace()
+    #         tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
+    #         tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
+    #         tokenizer.post_processor = TemplateProcessing(
+    #             single="<SOS> $A <EOS>",
+    #             special_tokens=[
+    #                 ("<SOS>", tokenizer.token_to_id("<SOS>")),
+    #                 ("<EOS>", tokenizer.token_to_id("<EOS>")),
+    #             ],
+    #         )
+    #         tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>")
+    #         if self.max_seq_len > 0:
+    #             tokenizer.enable_truncation(max_length=self.max_seq_len)
+    #         tokenizer.save(tokenizer_path)
+    #         print("Tokenizer is trained and saved")
+    #
+    #     tokenizer.decoder = decoders.WordPiece()
+    #
+    #     return tokenizer
 
-    def get_tokenizer(self):
-        train_tokenizer = False
-        tokenizer_path = os.path.join(self.data_dir, f"tokenizer_vocab[{self.vocab_size}].json")
-        if self.use_pretrained_tokenizer:
-            if os.path.exists(tokenizer_path):
-                tokenizer = Tokenizer.from_file(tokenizer_path)
-            else:
-                print("Pretrained tokenizer file is not found, train new tokenizer")
-                train_tokenizer = True
-        else:
-            train_tokenizer = True
-
-        if train_tokenizer:
-            # tokenizer = Tokenizer(BPE(unk_token="<UNK>"))
-            tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
-            # trainer = BpeTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"])
-            trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
-            tokenizer.pre_tokenizer = Whitespace()
-            tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
-            tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
-            tokenizer.post_processor = TemplateProcessing(
-                single="<SOS> $A <EOS>",
-                special_tokens=[
-                    ("<SOS>", tokenizer.token_to_id("<SOS>")),
-                    ("<EOS>", tokenizer.token_to_id("<EOS>")),
-                ],
-            )
-            tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>")
-            if self.max_seq_len > 0:
-                tokenizer.enable_truncation(max_length=self.max_seq_len)
-            tokenizer.save(tokenizer_path)
-            print("Tokenizer is trained and saved")
-
-        tokenizer.decoder = decoders.WordPiece()
-
-        return tokenizer
-
-    def make_io(self, val_main=10, val_sub=1):
-        X_df = pd.DataFrame(index=self.data.index)
-        if self.data_type == "class":
-            X_df['main'] = self.data['main_ipc'].apply(lambda x: self.vocab_w2i[x])
-            X_df['sub'] = self.data['sub_ipc'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
-            main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
-            X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
-        elif self.data_type == "claim":
-            tokenized_outputs = self.tokenizer.encode_batch(self.data['claims'])
-            X = np.vstack([output.ids for output in tokenized_outputs])
-
+    def make_io(self):
+        if self.use_keywords:
             claim_keywords = self.extract_keywords(self.data['claims'].tolist())
-            tokenized_outputs_keywords = self.tokenizer.encode_batch(claim_keywords)
-            X_keywords = np.vstack([output.ids for output in tokenized_outputs_keywords])
-
-        # X = np.vstack(X.values)
-        Y = self.data['TC'+str(self.n_TC)].values
-
+        else:
+            claim_keywords = None
+        TCs = self.data["TC"+str(self.n_TC)].values
         bins_criterion = {3: [0], 5: [0], 7: [0,2], 10: [0,4]}
-        Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
-
         if self.pred_type == "classification":
-            Y = Y_digitized
+            TCs_digitized = np.digitize(TCs, bins=bins_criterion[self.n_TC], right=True)
+        else:
+            TCs_digitized = None
 
-        return X, X_keywords, Y, Y_digitized
+        return claim_keywords, TCs, TCs_digitized
+
+    def __getitem__(self, idx):
+        claims = self.claim_keywords if self.use_keywords else self.data["claims"]
+        text_inputs = self.tokenizer(claims[idx], add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+        text_outputs = self.tokenizer(self.data["claims"][idx], add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+        targets = self.TCs_digitized[idx] if self.pred_type == "classification" else self.TCs[idx]
+
+        out = { "text_inputs": {"input_ids": torch.tensor(text_inputs["input_ids"], dtype=torch.long, device=self.device), "attention_mask": torch.tensor(text_inputs["attention_mask"], dtype=torch.long, device=self.device)},
+                "text_outputs": {"input_ids": torch.tensor(text_outputs["input_ids"], dtype=torch.long, device=self.device), "attention_mask": torch.tensor(text_outputs["attention_mask"], dtype=torch.long, device=self.device)},
+                "targets": torch.tensor(targets, dtype=torch.long, device=self.device) }
+        return out
+
+    # def make_io(self, val_main=10, val_sub=1):
+    #     X_df = pd.DataFrame(index=self.data.index)
+    #     if self.data_type == "class":
+    #         X_df['main'] = self.data['main_ipc'].apply(lambda x: self.vocab_w2i[x])
+    #         X_df['sub'] = self.data['sub_ipc'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
+    #         main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
+    #         X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
+    #     elif self.data_type == "claim":
+    #         # tokenized_outputs = self.tokenizer.encode_batch(self.data['claims'])
+    #         # X = np.vstack([output.ids for output in tokenized_outputs])
+    #
+    #         if self.config.use_keywords:
+    #             claim_keywords = self.extract_keywords(self.data['claims'].tolist())
+    #             tokenized_outputs_keywords = self.tokenizer.encode_batch(claim_keywords)
+    #             X_keywords = np.vstack([output.ids for output in tokenized_outputs_keywords])
+    #         else:
+    #             X_keywords = None
+    #
+    #     # X = np.vstack(X.values)
+    #     Y = self.data['TC'+str(self.n_TC)].values
+    #
+    #     bins_criterion = {3: [0], 5: [0], 7: [0,2], 10: [0,4]}
+    #     Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
+    #
+    #     if self.pred_type == "classification":
+    #         Y = Y_digitized
+    #
+    #     return X, X_keywords, Y, Y_digitized
 
     def extract_keywords(self, claims):
         cleaner = CleanTransformer(
@@ -194,15 +225,15 @@ class TechDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, idx):
-        if self.do_transform:
-            X, Y = self.transform(self.data.iloc[idx])
-        else:
-            X, Y = self.X[idx], self.Y[idx]
-            if self.use_keywords:
-                X_keywords = self.X_keywords[idx]
-                return X, X_keywords, Y
-        return X, Y
+    # def __getitem__(self, idx):
+    #     if self.do_transform:
+    #         X, Y = self.transform(self.data.iloc[idx])
+    #     else:
+    #         X, Y = self.X[idx], self.Y[idx]
+    #         if self.use_keywords:
+    #             X_keywords = self.X_keywords[idx]
+    #             return X, X_keywords, Y
+    #     return X, Y
 
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):

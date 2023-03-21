@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.6
-Description (primary changes): Integrate predictor
+Version: 0.7
+Description (primary changes): Use pre-trained models
 '''
 
 # Set root directory
@@ -326,3 +326,42 @@ class Transformer(nn.Module):
             dec_outputs = dec_self_attn_probs = dec_enc_attn_probs = None
 
         return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs, enc_outputs, pred_outputs
+
+class Transformer_pretrained(nn.Module):
+    def __init__(self, config):
+        super(Transformer_pretrained, self).__init__()
+        self.encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
+        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
+        self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
+
+    def forward(self, enc_inputs, dec_inputs):
+        enc_outputs = self.encoder(**enc_inputs)
+        enc_outputs = enc_outputs["last_hidden_state"] # enc_outputs: (batch_size, n_enc_seq, d_hidden)
+        z = enc_outputs[:, 0] # z: (batch_size, d_hidden)
+        if self.predictor is not None:
+            pred_outputs = self.predictor(z) # pred_outputs: (batch_size, n_outputs)
+        else:
+            pred_outputs = None
+        if self.decoder is not None:
+            dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        else:
+            dec_outputs = dec_self_attn_probs = dec_enc_attn_probs = None
+
+        return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs, enc_outputs, pred_outputs
+
+class Predictor(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.device = self.config.device
+
+        self.dropout = nn.Dropout(0.3)
+        self.classifier = nn.Linear(768, self.config.n_outputs)
+
+    def forward(self, x):
+        # x (enc_outputs): (batch_size, d_hidden)
+        batch_size = x.size(0)
+        x = self.dropout(x)
+        out = self.classifier(x)
+
+        return out

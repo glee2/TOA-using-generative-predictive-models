@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.82
-Description (primary changes): Modify classification task
+Version: 0.83
+Description (primary changes): Correspond to pre-trained model integration
 '''
 
 # Set root directory
@@ -142,7 +142,9 @@ if __name__=="__main__":
             device = torch.device('cpu')
             device_ids = []
 
-    configs.data.update({"root_dir": root_dir,
+    configs.data.update({"device": device,
+                            "device_ids": device_ids,
+                            "root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir,
                             "result_dir": result_dir})
