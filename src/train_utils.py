@@ -170,16 +170,18 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         print(f"Epoch {ep+1}\n"+str("-"*25))
 
         if train_params["alternate_train"]:
-            if ep % 2 == 0:
+            if ep > int(train_params["max_epochs"] * 0.8):
                 for p in model.module.decoder.parameters():
                     p.requires_grad = False
+                for p in model.module.predictor.parameters():
+                    p.requires_grad = True
             else:
                 for p in model.module.decoder.parameters():
                     p.requires_grad = True
                 for p in model.module.decoder.pos_emb.parameters():
                     p.requires_grad = False
-                # for p in model.module.predictor.parameters():
-                #     p.requires_grad = False
+                for p in model.module.predictor.parameters():
+                    p.requires_grad = False
 
         train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
         val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
@@ -252,10 +254,10 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch % 2 == 0:
-                        loss = loss_y
-                    else:
+                    if epoch > int(train_params["max_epochs"] * 0.8):
                         loss = loss_recon + loss_y
+                    else:
+                        loss = loss_recon# + loss_y
                 else:
                     loss = loss_recon + loss_y
                 dict_epoch_losses["recon"] += loss_recon.item()
@@ -328,10 +330,10 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
-                        if epoch % 2 == 0:
-                            loss = loss_y
-                        else:
+                        if epoch > int(train_params["max_epochs"] * 0.8):
                             loss = loss_recon + loss_y
+                        else:
+                            loss = loss_recon# + loss_y
                     else:
                         loss = loss_recon + loss_y
                     dict_epoch_losses["recon"] += loss_recon.item()
@@ -401,8 +403,6 @@ def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params
     manager = mp.Manager()
     ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in range(train_params["n_gpus"])})
     processes = []
-
-    print("ASDF")
 
     for device_rank in range(train_params["n_gpus"]):
         model_rank = copy.deepcopy(model.module)

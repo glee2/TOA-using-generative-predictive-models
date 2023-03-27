@@ -70,6 +70,7 @@ parser.add_argument("--batch_size", type=int)
 parser.add_argument("--n_folds", type=int)
 parser.add_argument("--max_epochs", type=int)
 parser.add_argument("--mem_verbose", default=False, action="store_true")
+parser.add_argument("--alternate_train", default=False, action="store_true")
 
 ## model arguments
 parser.add_argument("--use_accelerator", default=None, action="store_true")
