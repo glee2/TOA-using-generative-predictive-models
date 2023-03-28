@@ -113,7 +113,7 @@ class TechDataset(Dataset):
         # X = np.vstack(X.values)
         Y = self.data['TC'+str(self.n_TC)].values
 
-        bins_criterion = {3: [0], 5: [0], 7: [0,2], 10: [0,4]}
+        bins_criterion = {3: [0], 5: [3], 7: [0,2], 10: [0,4]}
         Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
 
         if self.pred_type == "classification":

@@ -254,7 +254,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch > int(train_params["max_epochs"] * 0.8):
+                    if epoch > int(train_params["max_epochs"] * 0.9):
                         loss = loss_recon + loss_y
                     else:
                         loss = loss_recon# + loss_y
@@ -330,7 +330,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
-                        if epoch > int(train_params["max_epochs"] * 0.8):
+                        if epoch > int(train_params["max_epochs"] * 0.9):
                             loss = loss_recon + loss_y
                         else:
                             loss = loss_recon# + loss_y
