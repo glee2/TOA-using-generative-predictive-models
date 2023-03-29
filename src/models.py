@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.5
-Description (primary changes): Add Transformer
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory
@@ -260,19 +260,69 @@ class Decoder(nn.Module):
 
         return dec_outputs, dec_self_attn_probs, dec_enc_attn_probs
 
-class Transformer(nn.Module):
+class Predictor(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.device = self.config.device
+
+        self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
+        # self.layers = self.set_layers(self.config.d_latent, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+        self.layers = self.set_layers(self.config.d_hidden, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+        self.relu = nn.ReLU()
+
+    def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
+        layers = [
+            nn.Sequential(
+                nn.Linear(d_input, d_hidden),
+                nn.ReLU()
+            )
+        ]
+        for _ in range(n_layers-1):
+            layers.append(
+                nn.Sequential(
+                    nn.Linear(d_hidden, d_hidden),
+                    nn.ReLU()
+                )
+            )
+        layers.append(nn.Sequential(nn.Linear(d_hidden, n_outputs)))
+        layers = nn.ModuleList(layers)
+
+        return layers
+
+    def forward(self, x):
+        # x (enc_outputs): (batch_size, n_enc_seq, d_hidden)
+        batch_size = x.size(0)
+        attn_weighted = self.attn_weight(x)
+        x = torch.bmm(attn_weighted.transpose(-1,1), x).squeeze()
+        # x = x.view(batch_size, -1) # Flatten input
+        for layer in self.layers:
+            x = layer(x)
+        out = x
+        # out = self.relu(out)
+
+        return out
+
+class Transformer(nn.Module):
+    def __init__(self, config, tokenizer=None):
+        super().__init__()
+        self.config = config
+        self.tokenizer = tokenizer
 
         self.encoder = Encoder(self.config)
-        self.decoder = Decoder(self.config)
+        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
+        self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
 
     def forward(self, enc_inputs, dec_inputs):
         # enc_inputs: (batch_size, n_enc_seq), dec_inputs: (batch_size, n_dec_seq)
-
         enc_outputs, enc_self_attn_probs = self.encoder(enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
-        dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs, enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
-#         dec_outputs = nn.Softmax(dim=-1)(dec_outputs)
+        if self.predictor is not None:
+            pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
+        else:
+            pred_outputs = None
+        if self.decoder is not None:
+            dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs, enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        else:
+            dec_outputs = dec_self_attn_probs = dec_enc_attn_probs = None
 
-        return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs
+        return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs, enc_outputs, pred_outputs

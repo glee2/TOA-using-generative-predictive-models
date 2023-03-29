@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.1
-Description (primary changes): Util functions
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory
@@ -27,12 +27,11 @@ from sklearn.metrics import confusion_matrix
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def token2class(sequences, configs, remove_extra=True):
+def token2class(sequences, vocabulary=None, remove_extra=True):
     TOKEN_SOS = "<SOS>"
     TOKEN_PAD = "<PAD>"
     TOKEN_EOS = "<EOS>"
 
-    vocabulary = configs.model.vocabulary_rev
     assert vocabulary is not None, "Vocabulary is empty"
     if not isinstance(sequences, list):
         sequences = [sequences]
@@ -44,88 +43,45 @@ def token2class(sequences, configs, remove_extra=True):
         output = [vocabulary[token] for token in sequence]
         if remove_extra:
             if TOKEN_EOS in output:
-                output = output[1:output.index(TOKEN_EOS)]
+                output = output[:output.index(TOKEN_EOS)]
             elif TOKEN_PAD in output:
                 temp_unq = np.unique(output, return_index=True)
-                output = output[1:temp_unq[1][list(temp_unq[0]).index(TOKEN_PAD)]]
+                output = output[:temp_unq[1][list(temp_unq[0]).index(TOKEN_PAD)]]
             else:
-                output = output[1:]
+                output = output[:]
         _, unq_idx = np.unique(output, return_index=True)
         output = list(np.array(output)[np.sort(unq_idx)])
         outputs.append(output)
 
     return outputs
 
-'''
-class DotDict(dict):
-    this = "this"
-    def __init__(self, *args, **kwargs):
-        super(DotDict, self).__init__(*args, **kwargs)
+def perturbed_decode(model, enc_inputs, perturb_degree=1e-2, configs={}):
+    enc_inputs = enc_inputs.to(configs.model.device)
+    enc_outputs, *_ = model.module.encoder(enc_inputs)
 
-        args_with_kwargs = []
-        for arg in args:
-            args_with_kwargs.append(arg)
-        args_with_kwargs.append(kwargs)
-        args = args_with_kwargs
+    enc_outputs_perturbed = torch.rand(enc_outputs.shape).to(device) * perturb_degree
 
-        for arg in args:
-            if isinstance(arg, dict):
-                for k, v in arg.items():
-                    self[k] = v
-                    if isinstance(v, dict):
-                        self[k] = DotDict(v)
-                    elif isinstance(v, str) or isinstance(v, bytes):
-                        self[k] = v
-                    elif isinstance(v, Iterable):
-                        klass = type(v)
-                        map_value: List[Any] = []
-                        for e in v:
-                            map_e = DotDict(e) if isinstance(e, dict) else e
-                            map_value.append(map_e)
-                        self[k] = klass(map_value)
+    preds_recon = torch.tile(torch.tensor(configs.model.vocabulary["<SOS>"]), dims=(enc_inputs.shape[0], 1)).to(configs.model.device)
+    preds_recon_perturbed = torch.tile(torch.tensor(configs.model.vocabulary["<SOS>"]), dims=(enc_inputs.shape[0], 1)).to(configs.model.device)
 
-    @classmethod
-    def load(cls, file):
-        with open(file, 'r') as f:
-            raw_dict = json.loads(f.read())
-            return DotDict(raw_dict)
+    for i in range(configs.model.n_dec_seq):
+        with torch.no_grad():
+            dec_outputs, *_ = model.module.decoder(preds_recon, enc_inputs, enc_outputs)
+            dec_outputs_perturbed, *_ = model.module.decoder(preds_recon_perturbed, enc_inputs, enc_outputs_perturbed)
+        pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
+        pred_tokens_perturbed = dec_outputs_perturbed.argmax(2)[:,-1].unsqueeze(1)
+        preds_recon = torch.cat([preds_recon, pred_tokens], axis=1)
+        preds_recon_perturbed = torch.cat([preds_recon_perturbed, pred_tokens_perturbed], axis=1)
 
-    @classmethod
-    def update(cls, d):
-        # return cls.__dict__.update(d)
-        print(type(cls), cls)
-        print(cls.this)
-        return cls
-
-    def __getattr__(self, attr):
-        return self.get(attr)
-
-    def __setattr__(self, key, value):
-        self.__setitem__(key, value)
-
-    def __getitem__(self, key):
-        return self.__dict__.get(key)
-
-    def __setitem__(self, key, value):
-        super(DotDict, self).__setitem__(key, value)
-        self.__dict__.update({key: value})
-
-    def __delattr__(self, item):
-        self.__delitem__(item)
-
-    def __delitem__(self, key):
-        super(DotDict, self).__delitem__(key)
-        del self.__dict__[key]
-
-    def __getstate__(self):
-        return self.__dict__
-
-    def __setstate__(self, d):
-        self.__dict__.update(d)
-'''
+    return preds_recon, preds_recon_perturbed
 
 # reference: https://mws.readthedocs.io/en/develop/_modules/mws/utils/collections.html#DotDict
 from collections.abc import Iterable, Mapping
+
+def print_gpu_memcheck(verbose, devices=[], stage="Non-specified"):
+    if verbose:
+        usages = ", ".join([f"[cuda{str(device.index)}]{str(np.round(torch.cuda.memory_allocated(device)/1024/1024, 1))}Mb" for device in devices])
+        print(f"[GPU-MEMCHECK] {stage}: {usages}")
 
 def unique_list_order_preserved(seq):
     seen = set()
@@ -189,3 +145,14 @@ class DotDict(dict):
             return obj.__class__(cls.build(x) for x in obj)
         # In all other cases, return `obj` unchanged.
         return obj
+
+class NumpyJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NumpyJSONEncoder, self).default(obj)

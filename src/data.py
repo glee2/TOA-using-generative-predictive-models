@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.6
-Description (primary changes): Add classification
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory
@@ -14,6 +14,8 @@ sys.path.append(root_dir)
 import os
 import copy
 import re
+import time
+import datetime
 import pandas as pd
 import numpy as np
 
@@ -26,6 +28,12 @@ import sklearn
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
 from sklearn.datasets import load_digits
+from tokenizers import Tokenizer, normalizers, decoders
+from tokenizers.models import BPE, WordPiece
+from tokenizers.trainers import BpeTrainer, WordPieceTrainer
+from tokenizers.pre_tokenizers import Whitespace
+from tokenizers.normalizers import NFD, Lowercase, StripAccents
+from tokenizers.processors import TemplateProcessing
 
 # Text cleaning libraries
 import nltk
@@ -36,40 +44,54 @@ from cleantext.sklearn import CleanTransformer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-TOKEN_SOS = "<SOS>"
-TOKEN_EOS = "<EOS>"
-TOKEN_PAD = "<PAD>"
-
 class TechDataset(Dataset):
     def __init__(self, config):
         super().__init__()
-        self.tokens = [TOKEN_SOS, TOKEN_EOS, TOKEN_PAD]
 
         for key, value in config.items():
             setattr(self, key, value)
 
-        if self.data_type in ["class", "claim"]:
-            self.rawdata = pd.read_csv(os.path.join(config.data_dir, "collection_final_with_claims.csv"))
-            self.data, self.vocab_w2i, self.vocab_i2w, self.vocab_size, self.seq_len = self.preprocess()
-            self.original_idx = np.array(self.data.index)
-            self.X, self.Y, self.Y_quantized = self.make_io()
-        elif self.data_type == "mnist":
-            self.rawdata = torchvision.datasets.MNIST('data', train=True, download=True)
-            self.data = self.rawdata.data.view(len(self.rawdata.data), -1).numpy()
-            self.X = self.data
-            self.Y = self.rawdata.targets.numpy()
-            n_values = self.X.max() - self.X.min() + 1
-            self.vocab_w2i = {str(x): x for x in range(n_values)}
-            self.vocab_w2i.update({self.tokens[i]: n_values+i for i in range(len(self.tokens))})
-            self.vocab_i2w = {x: str(x) for x in range(n_values)}
-            self.vocab_i2w.update({n_values+i: self.tokens[i] for i in range(len(self.tokens))})
-            self.vocab_size = len(self.vocab_w2i.keys())
+        self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
+        self.data = self.preprocess()
+        self.tokenizer = self.get_tokenizer()
+        self.original_idx = np.array(self.data.index)
+        self.X, self.X_keywords, self.Y, self.Y_digitized = self.make_io()
+        self.n_outputs = len(np.unique(self.Y_digitized)) if self.pred_type == "classification" else 1
 
-            self.X = np.concatenate([np.tile([self.vocab_w2i[TOKEN_SOS]], (self.X.shape[0],1)), self.X, np.tile([self.vocab_w2i[TOKEN_EOS]], (self.X.shape[0],1))], axis=1)
-            self.seq_len = self.X.shape[-1]
-            self.original_idx = np.arange(len(self.Y))
+    def get_tokenizer(self):
+        train_tokenizer = False
+        tokenizer_path = os.path.join(self.data_dir, f"tokenizer_vocab[{self.vocab_size}].json")
+        if self.use_pretrained_tokenizer:
+            if os.path.exists(tokenizer_path):
+                tokenizer = Tokenizer.from_file(tokenizer_path)
+            else:
+                print("Pretrained tokenizer file is not found, train new tokenizer")
+                train_tokenizer = True
+        else:
+            train_tokenizer = True
 
-        self.n_classes = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
+        if train_tokenizer:
+            tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
+            trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
+            tokenizer.pre_tokenizer = Whitespace()
+            tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
+            tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
+            tokenizer.post_processor = TemplateProcessing(
+                single="<SOS> $A <EOS>",
+                special_tokens=[
+                    ("<SOS>", tokenizer.token_to_id("<SOS>")),
+                    ("<EOS>", tokenizer.token_to_id("<EOS>")),
+                ],
+            )
+            tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>")
+            if self.max_seq_len > 0:
+                tokenizer.enable_truncation(max_length=self.max_seq_len)
+            tokenizer.save(tokenizer_path)
+            print("Tokenizer is trained and saved")
+
+        tokenizer.decoder = decoders.WordPiece()
+
+        return tokenizer
 
     def make_io(self, val_main=10, val_sub=1):
         X_df = pd.DataFrame(index=self.data.index)
@@ -79,19 +101,37 @@ class TechDataset(Dataset):
             main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
             X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
         elif self.data_type == "claim":
-            tokened_claims = self.data['claims'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
-            X = tokened_claims.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
+            tokenized_outputs = self.tokenizer.encode_batch(self.data['claims'])
+            X = np.vstack([output.ids for output in tokenized_outputs])
 
-        X = np.vstack(X.values)
+            claim_keywords = self.extract_keywords(self.data['claims'].tolist())
+            tokenized_outputs_keywords = self.tokenizer.encode_batch(claim_keywords)
+            X_keywords = np.vstack([output.ids for output in tokenized_outputs_keywords])
+
         Y = self.data['TC'+str(self.n_TC)].values
 
-        Y_quantized = np.zeros_like(Y).astype(int)
-        Y_quantized[Y>0] = 1
+        bins_criterion = {3: [0], 5: [3], 7: [0,2], 10: [0,4]}
+        Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
 
         if self.pred_type == "classification":
-            Y = Y_quantized
+            Y = Y_digitized
 
-        return X, Y, Y_quantized
+        return X, X_keywords, Y, Y_digitized
+
+    def extract_keywords(self, claims):
+        cleaner = CleanTransformer(
+                    lower=True, no_line_breaks=True, normalize_whitespace=True,
+                    no_punct=True, replace_with_punct="", strip_lines=True,
+                    no_currency_symbols=True, replace_with_currency_symbol="",
+                    no_numbers=False, replace_with_number="",
+                    no_digits=False, replace_with_digit="")
+        stop_words = stopwords.words("english")
+        cleaned = [re.sub("([-=+,#/\?:^.@*\"※~ㆍ!』‘|\(\)\[\]`\'…》\”\“\’·(\\n)])", " ", claim) for claim in claims]
+        cleaned = cleaner.transform(cleaned)
+        cleaned = [re.sub("(?<!\S)\d+(?!\S)", " ", claim).split() for claim in cleaned] # Also, remove standalone numbers
+        cleaned = [" ".join([word for word in claim if word not in stop_words + ["the"]]) for claim in cleaned]
+
+        return cleaned
 
     def transform(self, sample):
         main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
@@ -101,11 +141,15 @@ class TechDataset(Dataset):
 
     def preprocess(self):
         regex = re.compile("[0-9a-zA-Z\/]+")
-        cols_year = ['<1976']+list(np.arange(1976,2018).astype(str))
+        latest_year = datetime.datetime.now().year-1
+        cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
         if self.data_type == "class":
             rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','sub ipc'])[['number','main ipc','sub ipc']]
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            if self.target_ipc == "ALL":
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+            else:
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
             rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
             data = rawdata_ipc[['number']].copy(deep=True)
             assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
@@ -120,66 +164,27 @@ class TechDataset(Dataset):
                 data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: ["".join(regex.findall(xx)) for xx in x.split(';')])
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
         elif self.data_type == "claim":
-            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','claims']]
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
-            rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
-            cleaned_claims = self.text_cleaning(text_list=rawdata_ipc['claims'], claim_level=self.claim_level)
-            data = pd.concat([rawdata_ipc[['number']], cleaned_claims.rename('claims')], axis=1)
-            seq_len = data['claims'].apply(lambda x: len(x)).max() + 3
+            claim_separator = "\n\n\n"
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','sub ipc','claims']]
+            if self.target_ipc == "ALL":
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+            else:
+                # main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+                ## temporarily
+                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+            assert len(main_ipcs) != 0, "target ipc is not observed"
+            data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
 
-        rawdata_tc = self.rawdata.loc[rawdata_ipc.index][['year']+cols_year]
-        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x['year']+1 if x['year']<2017 else 2017, x['year']+self.n_TC+1 if x['year']+self.n_TC<2018 else 2018).astype(str)].sum(), axis=1)
+            if self.claim_level != -1:
+                data['claims'] = data['claims'].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
+
+        rawdata_tc = self.rawdata.loc[data.index]#[['year']+cols_year]
+
+        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
+
         data = data.set_index('number')
 
-        if self.data_type == "class":
-            main_ipcs = list(np.unique(data['main_ipc']))
-            sub_ipcs = list(np.unique(np.concatenate(list(data['sub_ipc'].values))))
-            all_items = list(np.union1d(main_ipcs, sub_ipcs))
-        elif self.data_type == "claim":
-            all_items = list(np.unique(np.concatenate(data['claims'].values)))
-
-        vocab_w2i = {all_items[i]: i for i in range(len(all_items))}
-        vocab_w2i.update({self.tokens[i]: len(all_items)+i for i in range(len(self.tokens))})
-        vocab_i2w = {i: all_items[i] for i in range(len(all_items))}
-        vocab_i2w.update({len(all_items)+i: self.tokens[i] for i in range(len(self.tokens))})
-        vocab_size = len(vocab_w2i)
-
-        return (data, vocab_w2i, vocab_i2w, vocab_size, seq_len)
-
-    def text_cleaning(self, text_list=None, claim_level=1, claim_separator="\n\n\n"):
-        if not isinstance(text_list, pd.core.series.Series): text_list = pd.Series(text_list)
-
-        basic_cleaner = CleanTransformer(
-                        lower=True, no_line_breaks=True, normalize_whitespace=True,
-                        no_punct=True, strip_lines=True,
-                        no_currency_symbols=True, replace_with_currency_symbol="",
-                        no_numbers=True, replace_with_number="",
-                        no_digits=True, replace_with_digit="")
-        stop_words = stopwords.words("english")
-        stemmer = PorterStemmer()
-
-        # Take the first claim
-        if claim_level == -1:
-            cleaned = text_list
-        else:
-            cleaned = text_list.apply(lambda x: "".join(x.split(claim_separator)[:claim_level]) if len(x.split(claim_separator))>=claim_level else x)
-        # Basic text cleaning
-        cleaned = basic_cleaner.transform(cleaned)
-        # Remove stopwords
-        cleaned = cleaned.apply(lambda claim: np.array([word for word in claim.split() if word not in stop_words]))
-        # Stemming
-        cleaned = cleaned.apply(lambda claim: [stemmer.stem(word) for word in claim])
-        # Remove duplicates and sorting
-        cleaned = cleaned.apply(lambda claim: list(np.array(claim)[np.sort(np.unique(claim, return_index=True)[1])]))
-        # Remove too frequent or too rare words
-        vocab, vocab_counts = np.unique(np.concatenate(cleaned.values), return_counts=True)
-        freq_words = vocab[np.where(vocab_counts>int(len(cleaned)*0.5))[0]] # frequent words: words that appear more than 40% of the data samples
-        rare_words = vocab[np.where(vocab_counts<3)[0]] # rare words: words that appear less than 2 times
-        # rare_words = vocab[np.where(vocab_counts<int(len(cleaned)*0.01))[0]] # rare words: words that appear less than 0.1% of the data samples
-        print(f"FREQ: {freq_words} ({len(freq_words)}), RARE: {rare_words} ({len(rare_words)})")
-        cleaned = cleaned.apply(lambda x: list(np.array(x)[~np.isin(x, np.concatenate([freq_words, rare_words]))]))
-
-        return cleaned
+        return data
 
     def __len__(self):
         return len(self.data)
@@ -189,14 +194,15 @@ class TechDataset(Dataset):
             X, Y = self.transform(self.data.iloc[idx])
         else:
             X, Y = self.X[idx], self.Y[idx]
+            if self.use_keywords:
+                X_keywords = self.X_keywords[idx]
+                return X, X_keywords, Y
         return X, Y
 
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
         self.stratify = stratify
-        # self.oversampled = oversampled
-        # self.labels = dataset.Y
-        self.labels = dataset.Y_quantized
+        self.labels = dataset.Y_digitized
         self.original_idx = dataset.original_idx
         self.dataset = dataset
         self.test_ratio = test_ratio
