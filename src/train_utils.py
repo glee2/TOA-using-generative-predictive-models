@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.63
-Description (primary changes): Apply [keywords input - Full text output] scheme
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory

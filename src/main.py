@@ -1,12 +1,13 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.83
-Description (primary changes): Retain indexes for patent data
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory
 root_dir = '/home2/glee/dissertation/1_tech_gen_impact/Transformer/Tech_Gen/'
+master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
@@ -93,7 +94,7 @@ if __name__=="__main__":
     mp.set_start_method("spawn")
 
     ''' PART 1: Configuration '''
-    data_dir = os.path.join(root_dir, "data")
+    data_dir = os.path.join(master_dir, "data")
     model_dir = os.path.join(root_dir, "models")
     result_dir = os.path.join(root_dir, "results")
     config_dir = os.path.join(root_dir, "configs")

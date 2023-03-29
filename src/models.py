@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.6
-Description (primary changes): Integrate predictor
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory

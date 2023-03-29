@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.2
-Description (primary changes): Add DotDict, print_gpu_memcheck, unique_list_order_preserved
+Version: 1.0
+Description (primary changes): Last version before integration into master branch
 '''
 
 # Set root directory
