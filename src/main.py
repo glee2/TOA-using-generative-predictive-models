@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 0.82
-Description (primary changes): Modify classification task
+Version: 0.83
+Description (primary changes): Retain indexes for patent data
 '''
 
 # Set root directory
@@ -320,6 +320,7 @@ if __name__=="__main__":
             preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
 
             eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[whole_idx].index)+[""])
             # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
             eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type)
             if configs.data.pred_type == "classification":
@@ -344,6 +345,7 @@ if __name__=="__main__":
             trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
             preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
             eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])
             eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
         with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[TRAIN-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
@@ -354,7 +356,9 @@ if __name__=="__main__":
             if "dec" in configs.model.model_type:
                 if args.eval_train_set:
                     eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+                    tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
                 eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+                tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
 
         torch.cuda.empty_cache()
 

@@ -7,7 +7,7 @@
             "claim_level": 1,
             "n_TC": 5,
             "do_transform": false,
-            "use_keywords": true,
+            "use_keywords": false,
             "max_seq_len": 256,
             "vocab_size": 2500,
             "use_pretrained_tokenizer": false},
