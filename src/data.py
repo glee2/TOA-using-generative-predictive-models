@@ -28,6 +28,7 @@ import sklearn
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
 from sklearn.datasets import load_digits
+from sklearn.preprocessing import LabelEncoder
 from tokenizers import Tokenizer, normalizers, decoders
 from tokenizers.models import BPE, WordPiece
 from tokenizers.trainers import BpeTrainer, WordPieceTrainer
@@ -52,11 +53,56 @@ class TechDataset(Dataset):
             setattr(self, key, value)
 
         self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
+        self.target_classes = None
         self.data = self.preprocess()
         self.tokenizer = self.get_tokenizer()
         self.original_idx = np.array(self.data.index)
-        self.X, self.X_keywords, self.Y, self.Y_digitized = self.make_io()
-        self.n_outputs = len(np.unique(self.Y_digitized)) if self.pred_type == "classification" else 1
+        self.X, self.Y, self.Y_digitized = self.make_io()
+        # self.n_outputs = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
+
+    def preprocess(self):
+        regex = re.compile("[0-9a-zA-Z\/]+")
+        latest_year = datetime.datetime.now().year-1
+        cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
+
+        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','sub ipc','claims']]
+        if self.target_ipc == "ALL":
+            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+        else:
+            # main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
+            ## temporarily
+            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+        assert len(main_ipcs) != 0, "target ipc is not observed"
+        data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+
+        rawdata_tc = self.rawdata.loc[data.index]
+
+        ## Get number of forward citations within 5 years (TC5)
+        data["TC"+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
+        data = data.reset_index(drop=True)
+        # self.datatest = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
+        # print(data["TC"+str(self.n_TC)])
+
+        ## Get digitized number of forward citations within 5 years (TC5_digitized)
+        bins_criterion = [data["TC"+str(self.n_TC)].quantile(0.9)]
+        # bins_criterion = {3: [0], 5: [3], 7: [0,2], 10: [0,4]}
+        # self.datatest2 = pd.Series(np.digitize(data["TC"+str(self.n_TC)].values, bins=bins_criterion, right=True))
+        data["TC"+str(self.n_TC)+"_digitized"] = pd.Series(np.digitize(data["TC"+str(self.n_TC)].values, bins=bins_criterion, right=True))
+        # print(data["TC"+str(self.n_TC)+"_digitized"])
+
+        ## Get patent class
+        patent_classes = data["main ipc"].apply(lambda x: x[:self.class_level]).values
+        label_encoder = LabelEncoder()
+        data["class"] = pd.Series(label_encoder.fit_transform(patent_classes))
+
+        if self.target_type == "class":
+            self.target_classes = label_encoder.classes_
+        elif self.target_type == "citation":
+            self.target_classes = ["Least_valuable", "Most_valuable"]
+
+        data = data.set_index('number')
+
+        return data
 
     def get_tokenizer(self):
         train_tokenizer = False
@@ -83,7 +129,7 @@ class TechDataset(Dataset):
                     ("<EOS>", tokenizer.token_to_id("<EOS>")),
                 ],
             )
-            tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>")
+            tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len)
             if self.max_seq_len > 0:
                 tokenizer.enable_truncation(max_length=self.max_seq_len)
             tokenizer.save(tokenizer_path)
@@ -92,31 +138,6 @@ class TechDataset(Dataset):
         tokenizer.decoder = decoders.WordPiece()
 
         return tokenizer
-
-    def make_io(self, val_main=10, val_sub=1):
-        X_df = pd.DataFrame(index=self.data.index)
-        if self.data_type == "class":
-            X_df['main'] = self.data['main_ipc'].apply(lambda x: self.vocab_w2i[x])
-            X_df['sub'] = self.data['sub_ipc'].apply(lambda x: [self.vocab_w2i[xx] for xx in x])
-            main_sub_combined = X_df.apply(lambda x: [x['main']]+x['sub'], axis=1)
-            X = main_sub_combined.apply(lambda x: np.concatenate([[self.vocab_w2i[TOKEN_SOS]]+x+[self.vocab_w2i[TOKEN_EOS]], np.zeros(self.seq_len-(len(x)+2))+self.vocab_w2i[TOKEN_PAD]]).astype(int))
-        elif self.data_type == "claim":
-            tokenized_outputs = self.tokenizer.encode_batch(self.data['claims'])
-            X = np.vstack([output.ids for output in tokenized_outputs])
-
-            claim_keywords = self.extract_keywords(self.data['claims'].tolist())
-            tokenized_outputs_keywords = self.tokenizer.encode_batch(claim_keywords)
-            X_keywords = np.vstack([output.ids for output in tokenized_outputs_keywords])
-
-        Y = self.data['TC'+str(self.n_TC)].values
-
-        bins_criterion = {3: [0], 5: [3], 7: [0,2], 10: [0,4]}
-        Y_digitized = np.digitize(Y, bins=bins_criterion[self.n_TC], right=True)
-
-        if self.pred_type == "classification":
-            Y = Y_digitized
-
-        return X, X_keywords, Y, Y_digitized
 
     def extract_keywords(self, claims):
         cleaner = CleanTransformer(
@@ -133,71 +154,71 @@ class TechDataset(Dataset):
 
         return cleaned
 
-    def transform(self, sample):
-        main_sub_combined = [self.vocab_w2i[sample['main_ipc']]] + [vocab_w2i[i] for i in sample['sub_ipc']]
-        X = np.concatenate([main_sub_combined, np.zeros(self.seq_len-(len(main_sub_combined)-2))+self.vocab_w2i[TOKEN_PAD]])
-        Y = sample['TC'+str(self.n_TC)]
-        return X, Y
+    def make_io(self, val_main=10, val_sub=1):
+        claim_separator = "\n\n\n"
+        if self.claim_level != -1:
+            X = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
+        else:
+            X = self.data["claims"]
 
-    def preprocess(self):
-        regex = re.compile("[0-9a-zA-Z\/]+")
-        latest_year = datetime.datetime.now().year-1
-        cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
+        if self.target_type == "citation":
+            Y_digitized = self.data["TC"+str(self.n_TC)+"_digitized"]
+            if self.pred_type == "regression":
+                Y = self.data["TC"+str(self.n_TC)]
+            elif self.pred_type == "classification":
+                Y = self.data["TC"+str(self.n_TC)+"_digitized"]
+        elif self.target_type == "class":
+            Y = Y_digitized = self.data["class"]
+        else:
+            Y = None
 
-        if self.data_type == "class":
-            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','sub ipc'])[['number','main ipc','sub ipc']]
-            if self.target_ipc == "ALL":
-                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
-            else:
-                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
-            rawdata_ipc = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
-            data = rawdata_ipc[['number']].copy(deep=True)
-            assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
-            if self.ipc_level == 1:
-                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0][:3])
-                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0][:3] for xx in x.split(';')])
-            elif self.ipc_level == 2:
-                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: regex.findall(x)[0])
-                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: [regex.findall(xx)[0] for xx in x.split(';')])
-            elif self.ipc_level == 3:
-                data['main_ipc'] = rawdata_ipc['main ipc'].apply(lambda x: "".join(regex.findall(x)))
-                data['sub_ipc'] = rawdata_ipc['sub ipc'].apply(lambda x: ["".join(regex.findall(xx)) for xx in x.split(';')])
-            seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
-        elif self.data_type == "claim":
-            claim_separator = "\n\n\n"
-            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','sub ipc','claims']]
-            if self.target_ipc == "ALL":
-                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
-            else:
-                # main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
-                ## temporarily
-                main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
-            assert len(main_ipcs) != 0, "target ipc is not observed"
-            data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
-
-            if self.claim_level != -1:
-                data['claims'] = data['claims'].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
-
-        rawdata_tc = self.rawdata.loc[data.index]#[['year']+cols_year]
-
-        data['TC'+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
-
-        data = data.set_index('number')
-
-        return data
+        return X, Y, Y_digitized
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        if self.do_transform:
-            X, Y = self.transform(self.data.iloc[idx])
-        else:
-            X, Y = self.X[idx], self.Y[idx]
+        input_claims = self.extract_keywords([self.X[idx]])[0] if self.use_keywords else self.X[idx]
+        output_claims = self.X[idx]
+        if str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "transformers": # Tokenizer for pretrained language models
+            text_inputs = self.tokenizer(input_claims, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+            text_inputs_dict = {"input_ids": torch.tensor(text_inputs["input_ids"], dtype=torch.long),
+                                "attention_mask": torch.tensor(text_inputs["attention_mask"], dtype=torch.long)}
             if self.use_keywords:
-                X_keywords = self.X_keywords[idx]
-                return X, X_keywords, Y
-        return X, Y
+                text_outputs = self.tokenizer(output_claims, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+                text_outputs_dict = {"input_ids": torch.tensor(text_outputs["input_ids"], dtype=torch.long),
+                                     "attention_mask": torch.tensor(text_outputs["attention_mask"], dtype=torch.long)}
+            else:
+                text_outputs_dict = text_inputs_dict
+        elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers": # Custom tokenizer
+            # text_inputs = self.tokenizer.encode_batch(input_claims)
+            # temp_ids, temp_masks = [], []
+            # for text_input in text_inputs:
+            #     temp_ids.append(torch.tensor(text_input.ids, dtype=torch.long))
+            #     temp_masks.append(torch.tensor(text_input.attention_mask, dtype=torch.long))
+            # text_inputs_dict = {"input_ids": torch.vstack(temp_ids), "attention_mask": torch.vstack(temp_masks)}
+            text_inputs = self.tokenizer.encode(input_claims)
+            text_inputs_dict = {"input_ids": torch.tensor(text_inputs.ids, dtype=torch.long), "attention_mask": torch.tensor(text_inputs.attention_mask, dtype=torch.long)}
+            if self.use_keywords:
+                # text_outputs = self.tokenizer.encode_batch(output_claims)
+                # temp_ids, temp_masks = [], []
+                # for text_output in text_outputs:
+                #     temp_ids.append(torch.tensor(text_output.ids, dtype=torch.long))
+                #     temp_masks.append(torch.tensor(text_output.attention_mask, dtype=torch.long))
+                # text_outputs_dict = {"input_ids": torch.vstack(temp_ids), "attention_mask": torch.vstack(temp_masks)}
+                text_outputs = self.tokenizer.encode(output_claims)
+                text_outputs_dict = {"input_ids": torch.tensor(text_outputs.ids, dtype=torch.long), "attention_mask": torch.tensor(text_outputs.attention_mask, dtype=torch.long)}
+            else:
+                text_outputs_dict = text_inputs_dict
+
+        # print(text_inputs_dict["input_ids"].shape)
+
+        target_dtype = torch.long if self.pred_type=="classification" else torch.float32
+        target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
+
+        out = {"text_inputs": text_inputs_dict, "text_outputs": text_outputs_dict, "targets": target_outputs}
+
+        return out
 
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):
@@ -272,3 +293,4 @@ class SMOTESampler:
         Y_over = Y_res[len(self.Y):]
 
         return X_over, Y_over, oversampled_idx
+#

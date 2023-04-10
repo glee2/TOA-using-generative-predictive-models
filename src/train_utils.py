@@ -37,7 +37,7 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 
 from data import TechDataset, CVSampler
 from models import Transformer
-from utils import token2class, print_gpu_memcheck
+from utils import token2class, print_gpu_memcheck, to_device
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 ON_IPYTHON = True
@@ -115,7 +115,7 @@ def build_model(model_params={}, trial=None, tokenizer=None):
 
     return model
 
-def train_model(model, train_loader, val_loader, model_params={}, train_params={}, trial=None):
+def train_model(model, train_loader, val_loader, model_params={}, train_params={}, class_weights=None, trial=None):
     device = model_params['device']
     writer = SummaryWriter(log_dir=os.path.join(train_params['root_dir'], "results", "TB_logs"))
     if train_params['use_accelerator']:
@@ -123,7 +123,8 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
-    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.CrossEntropyLoss()
+    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.CrossEntropyLoss()
+    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCELoss()
 
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
@@ -209,13 +210,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0}
 
         for i, batch_data in tqdm(enumerate(data_loader)):
-            if train_params['use_keywords']:
-                X, X_keywords, Y = batch_data
-                src, trg, y = X_keywords.to(device), X.to(device), Y.to(device)
-            else:
-                X, Y = batch_data
-                src, trg, y = X.to(device), X.to(device), Y.to(device)
-
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
 
             optimizer.zero_grad()
@@ -223,35 +217,35 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             if ON_IPYTHON:
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                     with record_function("model_feedforward"):
-                        outputs = model(src, trg[:,:-1]) # omit <eos> from target sequence
-                        outputs_recon = [output[0] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
-                        outputs_z = [output[-2] for output in outputs]
-                        outputs_y = [output[-1] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
+                        outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]["input_ids"][:,:-1]) # omit <eos> from target sequence
+                        outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                        outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
+                        outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
                         dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
             else:
-                outputs = model(src, trg[:,:-1]) # omit <eos> from target sequence
-                outputs_recon = [output[0] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
-                outputs_z = [output[-2] for output in outputs]
-                outputs_y = [output[-1] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
+                outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]["input_ids"][:,:-1]) # omit <eos> from target sequence
+                outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
+                outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
                 dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Forward pass")
 
             if "dec" in model_params["model_type"]:
                 preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
-                trues_recon = trg[:,1:] # omit <sos> from target sequence
+                trues_recon = batch_data["text_outputs"]["input_ids"][:,1:] # omit <sos> from target sequence
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
-                trues_y = y.to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else y
+                trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
             if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch > int(train_params["max_epochs"] * 0.9):
+                    if epoch > train_params["max_epochs"] - max(10, int(train_params["max_epochs"] * 0.1)):
                         loss = loss_recon + loss_y
                     else:
-                        loss = loss_recon# + loss_y
+                        loss = loss_recon
                 else:
                     loss = loss_recon + loss_y
                 dict_epoch_losses["recon"] += loss_recon.item()
@@ -296,25 +290,27 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
         with torch.no_grad():
             for i, batch_data in tqdm(enumerate(data_loader)):
-                if train_params['use_keywords']:
-                    X, X_keywords, Y = batch_data
-                    src, trg, y = X_keywords.to(device), X.to(device), Y.to(device)
+                if ON_IPYTHON:
+                    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
+                        with record_function("model_feedforward"):
+                            outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]["input_ids"][:,:-1]) # omit <eos> from target sequence
+                            outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                            outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
+                            outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
+                            dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
                 else:
-                    X, Y = batch_data
-                    src, trg, y = X.to(device), X.to(device), Y.to(device)
-
-                outputs = model(src, trg[:,:-1]) # omit <eos> from target sequence
-                outputs_recon = [output[0] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
-                outputs_z = [output[-2] for output in outputs]
-                outputs_y = [output[-1] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
-                dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                    outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]["input_ids"][:,:-1]) # omit <eos> from target sequence
+                    outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                    outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
+                    outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
+                    dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
 
                 if "dec" in model_params["model_type"]:
                     preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
-                    trues_recon = trg[:,1:] # omit <sos> from target sequence
+                    trues_recon = batch_data["text_outputs"]["input_ids"][:,1:] # omit <sos> from target sequence
                 if "pred" in model_params["model_type"]:
                     preds_y = dict_outputs["y"]
-                    trues_y = y
+                    trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
                 if model_params["model_type"] == "enc-pred-dec":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
@@ -323,22 +319,25 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                         if epoch > int(train_params["max_epochs"] * 0.9):
                             loss = loss_recon + loss_y
                         else:
-                            loss = loss_recon# + loss_y
+                            loss = loss_recon
                     else:
                         loss = loss_recon + loss_y
                     dict_epoch_losses["recon"] += loss_recon.item()
                     dict_epoch_losses["y"] += loss_y.item()
+                    # dict_epoch_losses["total"] += dict_epoch_losses["recon"] + dict_epoch_losses["y"]
                 elif model_params["model_type"] == "enc-pred":
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
+                    loss_recon = torch.tensor(0)
                     loss = loss_y
                     dict_epoch_losses["y"] += loss_y.item()
                 elif model_params["model_type"] == "enc-recon":
                     loss_recon = loss_f["recon"](preds_recon, trues_recon)
+                    loss_y = torch.tensor(0)
                     loss = loss_recon
                     dict_epoch_losses["recon"] += loss_recon.item()
 
                 # epoch_loss += loss.item()
-                dict_epoch_losses["total"] += loss.item()
+                dict_epoch_losses["total"] += loss_recon.item() + loss_y.item()
 
         dict_epoch_losses = {key: (value/len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
 
@@ -380,33 +379,46 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
     model = model.to(device=curr_device)
     with torch.no_grad():
         data_loader = queue_dataloader.get()
-        trues_recon, trues_y = [], []
-        trues_keywords_recon = []
+        trues_recon, trues_recon_kw, trues_y = [], [], []
         preds_recon, preds_y = [], []
 
         # for batch, (X_batch, Y_batch) in tqdm(enumerate(data_loader)):
         for batch, batch_data in tqdm(enumerate(data_loader)):
-            if train_params['use_keywords']:
-                X_batch, X_keywords_batch, Y_batch = batch_data
-            else:
-                X_batch, Y_batch = batch_data
-                X_keywords_batch = None
-            trues_recon.append(X_batch[:,1:].cpu().detach().numpy())
-            trues_keywords_recon.append(X_keywords_batch[:,1:].cpu().detach().numpy())
-            trues_y.append(Y_batch.cpu().detach().numpy())
+            # if train_params['use_keywords']:
+            #     X_batch, X_keywords_batch, Y_batch = batch_data
+            # else:
+            #     X_batch, Y_batch = batch_data
+            #     X_keywords_batch = None
+
+            trues_recon.append(batch_data["text_outputs"]["input_ids"][:,1:].cpu().detach().numpy())
+            trues_recon_kw.append(batch_data["text_inputs"]["input_ids"][:,1:].cpu().detach().numpy())
+            trues_y.append(batch_data["targets"].cpu().detach().numpy())
+
+            # trues_recon.append(X_batch[:,1:].cpu().detach().numpy())
+            # trues_keywords_recon.append(X_keywords_batch[:,1:].cpu().detach().numpy())
+            # trues_y.append(Y_batch.cpu().detach().numpy())
 
             # enc_inputs = X_batch.to(device=curr_device)
-            enc_inputs = X_keywords_batch.to(device=curr_device) if train_params['use_keywords'] else X_batch.to(device=curr_device)
-            enc_outputs, *_ = model.encoder(enc_inputs)
+            enc_inputs = {"input_ids": batch_data["text_inputs"]["input_ids"].to(device=curr_device), "attention_mask": batch_data["text_inputs"]["attention_mask"].to(device=curr_device)}
+            enc_outputs, *_ = model.encoder(**enc_inputs)
 
             if "pred" in model_params["model_type"]:
-                preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(X_batch.shape[0],1)).to(device=curr_device)
-                preds_y_batch = model.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
+                if model_params["take_last_h"]:
+                    z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
+                else:
+                    attn_weighted = model.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
+                    z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
+
+                preds_y_batch = model.predictor(z) # pred_outputs: (batch_size, n_outputs)
                 preds_y.append(preds_y_batch.cpu().detach().numpy())
 
             if "dec" in model_params["model_type"]:
+                if str(model_params["tokenizer"].__class__).split("\'")[1].split(".")[0] == "transformers":
+                    preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].convert_tokens_to_ids("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
+                elif str(model_params["tokenizer"].__class__).split("\'")[1].split(".")[0] == "tokenizers":
+                    preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
                 for i in range(model_params['n_dec_seq']-1):
-                    dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs, enc_outputs)
+                    dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
                     pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
                     preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
                 preds_recon.append(preds_recon_batch[:,1:].cpu().detach().numpy())
@@ -418,12 +430,12 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
             trues_y = preds_y = None
         if "dec" in model_params["model_type"]:
             trues_recon = np.concatenate(trues_recon)
-            trues_keywords_recon = np.concatenate(trues_keywords_recon)
+            trues_recon_kw = np.concatenate(trues_recon_kw)
             preds_recon = np.concatenate(preds_recon)
         else:
             trues_recon = preds_recon = None
 
-        ret_dict[device_rank]["recon"] = {"true": trues_recon, "pred": preds_recon} # omit <SOS>
+        ret_dict[device_rank]["recon"] = {"true": trues_recon, "pred": preds_recon, "kw": trues_recon_kw}
         ret_dict[device_rank]["y"] = {"true": trues_y, "pred": preds_y}
 
 def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
@@ -470,10 +482,16 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
     return np.mean(scores)
 
-def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', tokenizer=None):
+def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='regression', tokenizer=None, custom_criterion=None):
     if pred_type == 'classification':
         if trues.shape != preds.shape:
-            preds = preds.argmax(-1)
+            if custom_criterion is not None:
+                preds_new = np.zeros(preds.argmax(-1).shape)
+                preds_new[np.divide(preds[:,1], preds.sum(axis=1))>custom_criterion] = 1
+                preds = preds_new
+            else:
+                preds = preds.argmax(-1)
+
         metric_list = ['Support', 'Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
 
         cm = confusion_matrix(trues, preds)
@@ -522,10 +540,15 @@ def perf_eval(model_name, trues, preds, configs=None, pred_type='regression', to
         trues_claims = pd.Series(tokenizer.decode_batch(trues))
         preds_claims = pd.Series(tokenizer.decode_batch(preds, skip_special_tokens=False)).apply(lambda x: x.split("<EOS>")[0])
         BLEU_scores = pd.Series([sentence_bleu([t],p) for t,p in zip(trues_claims.values, preds_claims.values)])
-
-        eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)
-        eval_res.columns = ['Origin SEQ', 'Generated SEQ', "BLEU Score"]
-        eval_res.loc[len(eval_res)] = ["", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
+        if recon_kw is not None:
+            trues_claims_kw = pd.Series(tokenizer.decode_batch(recon_kw))
+            eval_res = pd.concat([trues_claims, trues_claims_kw, preds_claims, BLEU_scores], axis=1)
+            eval_res.columns = ['Origin SEQ', 'Keywords SEQ', 'Generated SEQ', "BLEU Score"]
+            eval_res.loc[len(eval_res)] = ["", "", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
+        else:
+            eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)
+            eval_res.columns = ['Origin SEQ', 'Generated SEQ', "BLEU Score"]
+            eval_res.loc[len(eval_res)] = ["", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
 
         return eval_res
     else:

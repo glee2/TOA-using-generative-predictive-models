@@ -61,6 +61,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--data_type", type=str)
 parser.add_argument("--target_ipc", type=str)
 parser.add_argument("--pred_type", type=str)
+parser.add_argument("--use_keywords", default=False, action="store_true")
 parser.add_argument("--use_pretrained_tokenizer", default=False, action="store_true")
 
 ## training arguments
@@ -92,6 +93,7 @@ parser.add_argument("--config_file", default=None, type=str)
 
 if __name__=="__main__":
     mp.set_start_method("spawn")
+    current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M")
 
     ''' PART 1: Configuration '''
     data_dir = os.path.join(master_dir, "data")
@@ -176,12 +178,13 @@ if __name__=="__main__":
         d_hidden = configs.model.d_hidden
         d_latent = configs.model.n_enc_seq * configs.model.d_hidden
 
-        key_components = {"data": ["target_ipc", "pred_type", "max_seq_len", "vocab_size"], "model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+        key_components = {"data": ["target_ipc", "pred_type", "max_seq_len", "vocab_size"], "model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head", "take_last_h"], "train": ["learning_rate", "batch_size", "max_epochs"]}
         config_name = ""
         for key in key_components.keys():
             for component in key_components[key]:
                 config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model]{config_name}.ckpt")
+        print(final_model_path)
 
     configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
@@ -189,7 +192,10 @@ if __name__=="__main__":
 
     ''' PART 2: Dataset setting '''
     tstart = time.time()
-    dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys["data"]])
+    org_config_keys_temp = copy.copy(org_config_keys["data"])
+    org_config_keys_temp.pop(org_config_keys_temp.index("use_pretrained_tokenizer"))
+    org_config_keys_temp.pop(org_config_keys_temp.index("data_file"))
+    dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys_temp])
     dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
     if os.path.exists(dataset_path) and args.do_save is False:
         print("Load pickled dataset...")
@@ -279,13 +285,8 @@ if __name__=="__main__":
         ## Load best model or train model
         final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
         if re.search("^1.", torch.__version__) is not None:
-            with torch.no_grad():
-                if configs.data.use_keywords:
-                    x_input, x_keywords_input, _ = tech_dataset.__getitem__(0)
-                else:
-                    x_input, _ = tech_dataset.__getitem__(0)
-                x_input = torch.tensor(x_input, device=device).unsqueeze(0)
-                print(pytorch_model_summary.summary(final_model.module, torch.zeros(x_input.shape, device=device, dtype=torch.long), torch.zeros(x_input.shape, device=device, dtype=torch.long), show_input=True, max_depth=None, show_parent_layers=True))
+            model_size = sum(t.numel() for t in final_model.module.parameters())
+            print(f"Model size: {model_size/1000**2:.1f}M paramaters")
         else:
             print("INFO: pytorch-model-summary does not support PyTorch 2.0, so just print model structure")
             print(final_model)
@@ -303,7 +304,8 @@ if __name__=="__main__":
                 converted_states[k] = v
             final_model.load_state_dict(converted_states)
         else:
-            final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train)
+            class_weights = torch.tensor(np.unique(tech_dataset.Y[whole_idx], return_counts=True)[1])
+            final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train, class_weights=class_weights)
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
         torch.cuda.empty_cache()
@@ -315,17 +317,22 @@ if __name__=="__main__":
             ## Evaluation on train dataset
             print("Validate model on train dataset")
             val_res_train = validate_model_mp(final_model, whole_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
-            trues_recon_train = np.concatenate([res["recon"]["true"] for res in val_res_train.values()])
-            preds_recon_train = np.concatenate([res["recon"]["pred"] for res in val_res_train.values()])
-            trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
-            preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
+            if "pred" in configs.model.model_type:
+                trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
+                preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
+                eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type, custom_criterion=None)
+                if configs.data.pred_type == "classification":
+                    eval_y_train, confmat_y_train = eval_y_train
 
-            eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
-            eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[whole_idx].index)+[""])
-            # eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
-            eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type)
-            if configs.data.pred_type == "classification":
-                eval_y_train, confmat_y_train = eval_y_train
+            if "dec" in configs.model.model_type:
+                trues_recon_train = np.concatenate([res["recon"]["true"] for res in val_res_train.values()])
+                preds_recon_train = np.concatenate([res["recon"]["pred"] for res in val_res_train.values()])
+                if configs.data.use_keywords:
+                    trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
+                else:
+                    trues_recon_kw_train = None
+                eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
+                eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[whole_idx].index)+[""])
         else:
             eval_recon_train = eval_y_train = confmat_y_train = None
 
@@ -335,7 +342,7 @@ if __name__=="__main__":
         if "pred" in configs.model.model_type:
             trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
             preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
-            eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type)
+            eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type, custom_criterion=None)
             if configs.data.pred_type == "classification":
                 eval_y_test, confmat_y_test = eval_y_test
             eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
@@ -344,12 +351,19 @@ if __name__=="__main__":
 
         if "dec" in configs.model.model_type:
             trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
+            if configs.data.use_keywords:
+                trues_recon_kw_test = np.concatenate([res["recon"]["kw"] for res in val_res_test.values()])
+            else:
+                trues_recon_kw_test = None
             preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
-            eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, recon_kw=trues_recon_kw_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
             eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])
-            eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
+            # eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
-        with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[TRAIN-RESULT][{configs.data.target_ipc}]{configs.train.config_name}.xlsx")) as writer:
+        fname_results_to_save = "[RESULTS]"+current_datetime+".xlsx"
+        fname_datasets_to_save = "[DATASET]"+current_datetime+".xlsx"
+
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
             if "pred" in configs.model.model_type:
                 eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
                 if configs.data.pred_type == "classification":
@@ -357,15 +371,18 @@ if __name__=="__main__":
             if "dec" in configs.model.model_type:
                 if args.eval_train_set:
                     eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
-                    tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
                 eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
-                tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_datasets_to_save)) as writer:
+            tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+            tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
 
         torch.cuda.empty_cache()
 
         configs_to_save = {configkey: {key: configs[configkey][key] for key in org_config_keys[configkey]} for configkey in org_config_keys}
-        fname_config_to_save = "[CONFIGS]"+datetime.datetime.now().strftime("%Y-%m-%d_%H:%M")+".json"
-        with open(os.path.join(config_dir, fname_config_to_save), "w") as f:
+        fname_config_to_save = "[CONFIGS]"+current_datetime+".json"
+        with open(os.path.join(config_dir, "USED_configs", fname_config_to_save), "w") as f:
+            json.dump(configs_to_save, f, indent=4)
+        with open(os.path.join(configs.data.result_dir, "USED_configs", fname_config_to_save), "w") as f:
             json.dump(configs_to_save, f, indent=4)
 
     else:
@@ -401,6 +418,8 @@ if __name__=="__main__":
         if configs.data.pred_type == "classification":
             eval_y, confmat_y = eval_y
 
-        with pd.ExcelWriter(os.path.join(configs.data.result_dir,f"[LOADED-RESULT]{configs.train.config_name}.xlsx")) as writer:
+        fname_results_to_save = "[LOADED_RESULTS]"+current_datetime+".xlsx"
+
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
             eval_y.to_excel(writer, sheet_name=configs.data.pred_type+" results")
             eval_recon.to_excel(writer, sheet_name="Generation results")

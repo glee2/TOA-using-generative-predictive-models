@@ -27,6 +27,12 @@ from sklearn.metrics import confusion_matrix
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def to_device(x, device):
+    if isinstance(x, dict):
+        return {k: v.to(device) for k,v in x.items()}
+    elif isinstance(x, torch.Tensor):
+        return x.to(device)
+
 def token2class(sequences, vocabulary=None, remove_extra=True):
     TOKEN_SOS = "<SOS>"
     TOKEN_PAD = "<PAD>"
