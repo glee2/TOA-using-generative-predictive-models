@@ -5,6 +5,8 @@ Version: 1.0
 Description (primary changes): Last version before integration into master branch
 '''
 
+''' GIT test '''
+
 # Set root directory
 root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
