@@ -18,6 +18,7 @@ import time
 import datetime
 import pandas as pd
 import numpy as np
+from functools import partial
 
 # DL libraries
 import torch
@@ -107,11 +108,11 @@ class TechDataset(Dataset):
             tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
             def custom_token_to_id(self): return self.convert_tokens_to_ids
             tokenizer.token_to_id = custom_token_to_id(tokenizer)
-            def custom_get_vocab_size(self): return self.vocab_size
-            tokenizer.get_vocab_size = custom_get_vocab_size(tokenizer)
+            # def custom_get_vocab_size(self): return self.vocab_size
+            # tokenizer.get_vocab_size = partial(custom_get_vocab_size, tokenizer)
             def custom_decode_batch(self): return self.batch_decode
             tokenizer.decode_batch = custom_decode_batch(tokenizer)
-            def custom_encode_batch(self): return self.batch_encode
+            def custom_encode_batch(self): return self.encode
             tokenizer.encode_batch = custom_encode_batch(tokenizer)
         else:
             train_tokenizer = False
@@ -141,6 +142,7 @@ class TechDataset(Dataset):
                 tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len)
                 if self.max_seq_len > 0:
                     tokenizer.enable_truncation(max_length=self.max_seq_len)
+                tokenizer.vocab_size = tokenizer.get_vocab_size()
                 tokenizer.save(tokenizer_path)
                 print("Tokenizer is trained and saved")
 
@@ -200,7 +202,7 @@ class TechDataset(Dataset):
             else:
                 text_outputs_dict = text_inputs_dict
         elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers": # Custom tokenizer
-            text_inputs = self.tokenizer.encode(input_claims)
+            text_inputs = self.tokenizer.encode(input_claims) if isinstance(input_claims, str) else self.tokenizer.encode_batch(input_claims)
             text_inputs_dict = {"input_ids": torch.tensor(text_inputs.ids, dtype=torch.long), "attention_mask": torch.tensor(text_inputs.attention_mask, dtype=torch.long)}
             if self.use_keywords:
                 text_outputs = self.tokenizer.encode(output_claims)

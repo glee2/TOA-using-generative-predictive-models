@@ -403,7 +403,11 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
 
             # enc_inputs = X_batch.to(device=curr_device)
             enc_inputs = {"input_ids": batch_data["text_inputs"]["input_ids"].to(device=curr_device), "attention_mask": batch_data["text_inputs"]["attention_mask"].to(device=curr_device)}
-            enc_outputs, *_ = model.encoder(**enc_inputs)
+            if model_params["is_pretrained"]:
+                enc_outputs_base = model.encoder(**enc_inputs)
+                enc_outputs, enc_self_attn_probs = enc_outputs_base.last_hidden_state, enc_outputs_base.attentions
+            else:
+                enc_outputs, *_ = model.encoder(**enc_inputs)
 
             if "pred" in model_params["model_type"]:
                 # if model_params["take_last_h"]:

@@ -212,14 +212,16 @@ if __name__=="__main__":
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
     configs.model.update({"tokenizer": tech_dataset.tokenizer,
-                        "n_enc_vocab": tech_dataset.tokenizer.get_vocab_size(),
-                        "n_dec_vocab": tech_dataset.tokenizer.get_vocab_size(),
+                        "n_enc_vocab": tech_dataset.tokenizer.vocab_size,
+                        "n_dec_vocab": tech_dataset.tokenizer.vocab_size,
                         "n_enc_seq": tech_dataset.max_seq_len,
                         "n_dec_seq": tech_dataset.max_seq_len,
                         "n_outputs": 1 if configs.data.pred_type=="regression" else tech_dataset.n_outputs,
                         "i_padding": tech_dataset.tokenizer.token_to_id("<PAD>")})
     if not configs.train.do_tune:
         configs.model.update({"d_latent": configs.model.n_enc_seq * configs.model.d_hidden})
+    if configs.model.is_pretrained:
+        configs.model.update({"d_hidden": 768})
 
     ''' PART 3: Training '''
     if configs.train.do_train:
@@ -339,7 +341,7 @@ if __name__=="__main__":
 
         ## Evaluation on test dataset
         print("Validate model on test dataset")
-        val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
+        val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=16, model_params=configs.model, train_params=configs.train)
         if "pred" in configs.model.model_type:
             trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
             preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
@@ -387,7 +389,7 @@ if __name__=="__main__":
             json.dump(configs_to_save, f, indent=4)
 
     else:
-        final_model = build_model(configs.model)
+        final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
         if os.path.exists(final_model_path):
             best_states = torch.load(final_model_path)
         else:

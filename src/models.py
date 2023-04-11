@@ -334,7 +334,11 @@ class Transformer(nn.Module):
 
     def forward(self, enc_inputs, dec_inputs):
         # enc_inputs: (batch_size, n_enc_seq), dec_inputs: (batch_size, n_dec_seq)
-        enc_outputs, enc_self_attn_probs = self.encoder(**enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
+        if self.config.is_pretrained:
+            enc_outputs_base = self.encoder(**enc_inputs)
+            enc_outputs, enc_self_attn_probs = enc_outputs_base.last_hidden_state, enc_outputs_base.attentions
+        else:
+            enc_outputs, enc_self_attn_probs = self.encoder(**enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
         if self.predictor is not None:
             pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
             if self.config.take_last_h:
