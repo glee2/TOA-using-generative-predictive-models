@@ -124,7 +124,9 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
     # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.CrossEntropyLoss()
-    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCELoss()
+    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss()
+    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
+    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCELoss()
 
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
@@ -164,7 +166,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         epoch_start = time.time()
         print(f"Epoch {ep+1}\n"+str("-"*25))
 
-        if train_params["alternate_train"]:
+        if model_params["model_type"]=="enc-pred-dec" and train_params["alternate_train"]:
             if ep > int(train_params["max_epochs"] * 0.8):
                 for p in model.module.decoder.parameters():
                     p.requires_grad = False
@@ -242,7 +244,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch > train_params["max_epochs"] - max(10, int(train_params["max_epochs"] * 0.1)):
+                    if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
                         loss = loss_recon + loss_y
                     else:
                         loss = loss_recon
@@ -316,7 +318,8 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
-                        if epoch > int(train_params["max_epochs"] * 0.9):
+                        # if epoch > int(train_params["max_epochs"] * 0.9):
+                        if epoch > train_params["max_epochs"] - max(15, int(train_params["max_epochs"] * 0.2)):
                             loss = loss_recon + loss_y
                         else:
                             loss = loss_recon
@@ -403,20 +406,17 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
             enc_outputs, *_ = model.encoder(**enc_inputs)
 
             if "pred" in model_params["model_type"]:
-                if model_params["take_last_h"]:
-                    z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-                else:
-                    attn_weighted = model.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
-                    z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
+                # if model_params["take_last_h"]:
+                #     z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
+                # else:
+                #     attn_weighted = model.predictor.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
+                #     z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
 
-                preds_y_batch = model.predictor(z) # pred_outputs: (batch_size, n_outputs)
+                preds_y_batch = model.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
                 preds_y.append(preds_y_batch.cpu().detach().numpy())
 
             if "dec" in model_params["model_type"]:
-                if str(model_params["tokenizer"].__class__).split("\'")[1].split(".")[0] == "transformers":
-                    preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].convert_tokens_to_ids("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
-                elif str(model_params["tokenizer"].__class__).split("\'")[1].split(".")[0] == "tokenizers":
-                    preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
+                preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
                 for i in range(model_params['n_dec_seq']-1):
                     dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
                     pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
@@ -482,19 +482,22 @@ def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
 
     return np.mean(scores)
 
-def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='regression', tokenizer=None, custom_criterion=None):
+def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='regression', tokenizer=None, custom_weight=None):
     if pred_type == 'classification':
         if trues.shape != preds.shape:
-            if custom_criterion is not None:
-                preds_new = np.zeros(preds.argmax(-1).shape)
-                preds_new[np.divide(preds[:,1], preds.sum(axis=1))>custom_criterion] = 1
-                preds = preds_new
+            preds_new = copy.deepcopy(preds)
+            if custom_weight is not None:
+                criterion_vec = np.ones_like(preds_new[:,1])
+                criterion_vec[preds_new[:,1]<0] *= custom_weight
+                criterion_vec[preds_new[:,1]>=0] *= 1/custom_weight
+                preds_new[:,1] *= criterion_vec
+                preds_new = preds_new.argmax(-1)
             else:
-                preds = preds.argmax(-1)
+                preds_new = preds_new.argmax(-1)
 
         metric_list = ['Support', 'Accuracy', 'Recall', 'Precision', 'F1 score', 'Specificity', 'NPV']
 
-        cm = confusion_matrix(trues, preds)
+        cm = confusion_matrix(trues, preds_new)
 
         metric_dict = {}
         for c in range(configs.model.n_outputs):
@@ -515,7 +518,7 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         df_model_name = pd.DataFrame(np.tile([""], len(eval_res.columns))[np.newaxis,:], index=[model_name], columns=eval_res.columns)
         eval_res = pd.concat([df_model_name, eval_res])
 
-        conf_mat_res = conf_mat_res = pd.DataFrame(cm, index=["True "+str(i) for i in range(configs.model.n_outputs)], columns=["Predicted "+str(i) for i in range(configs.model.n_outputs)])
+        conf_mat_res = pd.DataFrame(cm, index=["True "+str(i) for i in range(2)], columns=["Predicted "+str(i) for i in range(2)])
         df_model_name = pd.DataFrame(np.tile([""], len(conf_mat_res.columns))[np.newaxis,:], index=[model_name], columns=conf_mat_res.columns)
         conf_mat_res = pd.concat([df_model_name, conf_mat_res])
 

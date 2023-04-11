@@ -52,9 +52,9 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from models import Transformer
+from models import Transformer, Predictor
 from train_utils import EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model_mp
-from utils import token2class, DotDict
+from utils import token2class, DotDict, to_device
 
 parser = argparse.ArgumentParser()
 ## data arguments
@@ -75,6 +75,7 @@ parser.add_argument("--mem_verbose", default=False, action="store_true")
 parser.add_argument("--alternate_train", default=False, action="store_true")
 
 ## model arguments
+parser.add_argument("--is_pretrained", default=None, action="store_true")
 parser.add_argument("--use_accelerator", default=None, action="store_true")
 parser.add_argument("--n_layers", type=int)
 parser.add_argument("--d_embedding", type=int)
@@ -132,7 +133,6 @@ if __name__=="__main__":
         accelerator = Accelerator()
         device_ids = list(range(torch.cuda.device_count()))
         device = accelerator.device
-
         configs.train.update({"accelerator": accelerator})
     else:
         if torch.cuda.is_available():
@@ -149,7 +149,8 @@ if __name__=="__main__":
     configs.data.update({"root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir,
-                            "result_dir": result_dir})
+                            "result_dir": result_dir,
+                            "is_pretrained": configs.model.is_pretrained})
     configs.train.update({"device": device,
                             "device_ids": device_ids,
                             "root_dir": root_dir,
@@ -184,7 +185,6 @@ if __name__=="__main__":
             for component in key_components[key]:
                 config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model]{config_name}.ckpt")
-        print(final_model_path)
 
     configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
@@ -305,7 +305,8 @@ if __name__=="__main__":
             final_model.load_state_dict(converted_states)
         else:
             class_weights = torch.tensor(np.unique(tech_dataset.Y[whole_idx], return_counts=True)[1])
-            final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train, class_weights=class_weights)
+            pos_weight = class_weights[0]/class_weights[1]
+            final_model = train_model(final_model, train_loader, val_loader, configs.model, configs.train, class_weights=pos_weight)
         torch.save(final_model.state_dict(), final_model_path) # Finalize
 
         torch.cuda.empty_cache()
@@ -320,7 +321,7 @@ if __name__=="__main__":
             if "pred" in configs.model.model_type:
                 trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
                 preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
-                eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type, custom_criterion=None)
+                eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type, custom_weight=None)
                 if configs.data.pred_type == "classification":
                     eval_y_train, confmat_y_train = eval_y_train
 
@@ -342,7 +343,7 @@ if __name__=="__main__":
         if "pred" in configs.model.model_type:
             trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
             preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
-            eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type, custom_criterion=None)
+            eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type, custom_weight=None)
             if configs.data.pred_type == "classification":
                 eval_y_test, confmat_y_test = eval_y_test
             eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)

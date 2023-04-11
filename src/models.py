@@ -269,10 +269,11 @@ class Predictor(nn.Module):
         self.config = config
         self.device = self.config.device
 
-        # self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
+        self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
         # self.layers = self.set_layers(self.config.d_latent, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
         self.layers = self.set_layers(self.config.d_hidden, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
         self.softmax = nn.Softmax()
+        self.log_softmax = nn.LogSoftmax(dim=1)
         self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
@@ -298,13 +299,18 @@ class Predictor(nn.Module):
     def forward(self, x):
         # x (enc_outputs): (batch_size, n_enc_seq, d_hidden)
         batch_size = x.size(0)
-        # attn_weighted = self.attn_weight(x)
-        # x = torch.bmm(attn_weighted.transpose(-1,1), x).squeeze()
-        # x = x.view(batch_size, -1) # Flatten input
+
+        if self.config.take_last_h:
+            x = x[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
+        else:
+            attn_weighted = self.attn_weight(x) # attn_weighted: (batch_size, n_enc_seq, 1)
+            x = torch.bmm(attn_weighted.transpose(-1, 1), x).squeeze() # z: (batch_size, d_hidden)
+
         for layer in self.layers:
             x = layer(x)
-        out = x
-        out = self.sigmoid(out)
+        out = x if batch_size > 1 else x.unsqueeze(0)
+        out = self.log_softmax(out)
+        # out = self.sigmoid(out)
         # out = self.relu(out)
 
         return out
@@ -313,6 +319,7 @@ class Transformer(nn.Module):
     def __init__(self, config, tokenizer=None):
         super(Transformer, self).__init__()
         self.config = config
+        self.device = self.config.device
         self.tokenizer = tokenizer
 
         if self.config.is_pretrained:
@@ -321,23 +328,24 @@ class Transformer(nn.Module):
         else:
             self.encoder = Encoder(self.config)
         self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
-        if self.predictor is not None:
-            self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
+        # if self.predictor is not None:
+        #     self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
         self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
 
     def forward(self, enc_inputs, dec_inputs):
         # enc_inputs: (batch_size, n_enc_seq), dec_inputs: (batch_size, n_dec_seq)
         enc_outputs, enc_self_attn_probs = self.encoder(**enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
         if self.predictor is not None:
+            pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
             if self.config.take_last_h:
                 z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
             else:
-                attn_weighted = self.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
+                attn_weighted = self.predictor.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
                 z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
-            # pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
-            pred_outputs = self.predictor(z) # pred_outputs: (batch_size, n_outputs)
+            # pred_outputs = self.predictor(z) # pred_outputs: (batch_size, n_outputs)
         else:
             pred_outputs = None
+
         if self.decoder is not None:
             dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
         else:
@@ -350,13 +358,14 @@ class Transformer(nn.Module):
 
     def encode(self, enc_inputs):
         enc_outputs, *_ = self.encoder(**enc_inputs)
-        if self.config.take_last_h:
-            z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-        else:
-            attn_weighted = self.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
-            z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
+        # if self.config.take_last_h:
+        #     z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
+        # else:
+        #     attn_weighted = self.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
+        #     z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
 
-        return z
+        # return z
+        return enc_outputs
 
     def predict(self, z):
         return self.predictor(z)
@@ -366,16 +375,19 @@ class Transformer(nn.Module):
 
         if dec_inputs is not None:
             dec_outputs, *_ = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+
         else:
-            if str(self.tokenizer.__class__).split("\"")[1].split(".")[0] == "transformers":
-                preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.convert_tokens_to_ids("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
-            elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers":
-                preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.token_to_id("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
+            # if str(self.tokenizer.__class__).split("\"")[1].split(".")[0] == "transformers":
+            #     preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.convert_tokens_to_ids("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
+            # elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers":
+            preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.token_to_id("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
 
-        for i in range(self.config.n_dec_seq - 1):
-            dec_outputs, *_ = self.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
-            pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
-            preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
-            torch.cuda.empty_cache()
+            for i in range(self.config.n_dec_seq - 1):
+                dec_outputs, *_ = self.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
+                pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
+                preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
+                torch.cuda.empty_cache()
 
-        return preds_recon_batch
+            dec_outputs = preds_recon_batch
+
+        return dec_outputs
