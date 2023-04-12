@@ -6,7 +6,7 @@ Description (primary changes): Last version before integration into master branc
 '''
 
 # Set root directory
-root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/class2class/Tech_Gen/'
 master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
