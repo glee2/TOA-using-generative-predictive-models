@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.0
-Description (primary changes): Last version before integration into master branch
+Version: 1.2
+Description (primary changes): Class to class
 '''
 
 # Set root directory
@@ -75,11 +75,13 @@ parser.add_argument("--mem_verbose", default=False, action="store_true")
 parser.add_argument("--alternate_train", default=False, action="store_true")
 
 ## model arguments
-parser.add_argument("--is_pretrained", default=None, action="store_true")
+parser.add_argument("--pretrained_enc", default=None, action="store_true")
+parser.add_argument("--pretrained_dec", default=None, action="store_true")
 parser.add_argument("--use_accelerator", default=None, action="store_true")
 parser.add_argument("--n_layers", type=int)
 parser.add_argument("--d_embedding", type=int)
-parser.add_argument("--d_hidden", type=int)
+parser.add_argument("--d_enc_hidden", type=int)
+parser.add_argument("--d_pred_hidden", type=int)
 parser.add_argument("--d_ff", type=int)
 parser.add_argument("--n_head", type=int)
 parser.add_argument("--d_head", type=int)
@@ -150,7 +152,8 @@ if __name__=="__main__":
                             "data_dir": data_dir,
                             "model_dir": model_dir,
                             "result_dir": result_dir,
-                            "is_pretrained": configs.model.is_pretrained})
+                            "pretrained_enc": configs.model.pretrained_enc,
+                            "pretrained_dec": configs.model.pretrained_dec})
     configs.train.update({"device": device,
                             "device_ids": device_ids,
                             "root_dir": root_dir,
@@ -167,8 +170,9 @@ if __name__=="__main__":
     if configs.train.do_train and configs.train.do_tune:
         n_layers = configs.model.n_layers = None
         d_embedding = configs.model.d_embedding = None
-        d_hidden = configs.model.d_hidden = None
-        d_latent = None
+        d_enc_hidden = configs.model.d_enc_hidden = None
+        d_pred_hidden = configs.model.d_pred_hidden = None
+        d_latent = 64
         learning_rate = configs.train.learning_rate = None
         batch_size = configs.train.batch_size = None
         config_name = "HPARAM_TUNING"
@@ -176,24 +180,25 @@ if __name__=="__main__":
     else:
         n_layers = configs.model.n_layers
         d_embedding = configs.model.d_embedding
-        d_hidden = configs.model.d_hidden
-        d_latent = configs.model.n_enc_seq * configs.model.d_hidden
+        d_enc_hidden = configs.model.d_enc_hidden
+        d_pred_hidden = configs.model.d_pred_hidden
+        # d_latent = configs.model.n_enc_seq * configs.model.d_hidden
 
-        key_components = {"data": ["target_ipc", "pred_type", "max_seq_len", "vocab_size"], "model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head", "take_last_h"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+        key_components = {"data": ["target_ipc", "max_seq_len", "vocab_size"], "model": ["n_layers", "d_enc_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
         config_name = ""
         for key in key_components.keys():
             for component in key_components[key]:
                 config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model]{config_name}.ckpt")
 
-    configs.model.update({"d_latent": d_latent})
+    # configs.model.update({"d_latent": d_latent})
     configs.train.update({"config_name": config_name,
                             "final_model_path": final_model_path})
 
     ''' PART 2: Dataset setting '''
     tstart = time.time()
     org_config_keys_temp = copy.copy(org_config_keys["data"])
-    org_config_keys_temp.pop(org_config_keys_temp.index("use_pretrained_tokenizer"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("use_pretrained_tokenizer"))
     org_config_keys_temp.pop(org_config_keys_temp.index("data_file"))
     dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys_temp])
     dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
@@ -201,6 +206,10 @@ if __name__=="__main__":
         print("Load pickled dataset...")
         with open(dataset_path, "rb") as f:
             tech_dataset = pickle.load(f)   # Load pickled dataset if dataset with same configuration already saved
+            if tech_dataset.pretrained_enc != configs.data.pretrained_enc or tech_dataset.pretrained_dec != configs.data.pretrained_dec:
+                tech_dataset.pretrained_enc = configs.data.pretrained_enc
+                tech_dataset.pretrained_dec = configs.data.pretrained_dec
+                tech_dataset.tokenizers = tech_dataset.get_tokenizers()
         print("Pickled dataset loaded")
     else:
         print("Make dataset...")
@@ -211,17 +220,17 @@ if __name__=="__main__":
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
-    configs.model.update({"tokenizer": tech_dataset.tokenizer,
-                        "n_enc_vocab": tech_dataset.tokenizer.vocab_size,
-                        "n_dec_vocab": tech_dataset.tokenizer.vocab_size,
+    configs.model.update({"tokenizers": tech_dataset.tokenizers,
+                        "n_enc_vocab": tech_dataset.tokenizers["enc"].vocab_size,
+                        "n_dec_vocab": tech_dataset.tokenizers["dec"].vocab_size,
                         "n_enc_seq": tech_dataset.max_seq_len,
                         "n_dec_seq": tech_dataset.max_seq_len,
                         "n_outputs": 1 if configs.data.pred_type=="regression" else tech_dataset.n_outputs,
-                        "i_padding": tech_dataset.tokenizer.token_to_id("<PAD>")})
-    if not configs.train.do_tune:
-        configs.model.update({"d_latent": configs.model.n_enc_seq * configs.model.d_hidden})
-    if configs.model.is_pretrained:
-        configs.model.update({"d_hidden": 768})
+                        "i_padding": tech_dataset.tokenizers["enc"].token_to_id("<PAD>")})
+    # if not configs.train.do_tune:
+    #     configs.model.update({"d_latent": configs.model.n_enc_seq * configs.model.d_hidden})
+    if configs.model.pretrained_enc:
+        configs.model.update({"d_enc_hidden": 768})
 
     ''' PART 3: Training '''
     if configs.train.do_train:
@@ -247,7 +256,7 @@ if __name__=="__main__":
             configs.train.update({k: v for k,v in best_params.items() if k in configs.train.keys()})
             configs.model.update({k: v for k,v in best_params.items() if k in configs.model.keys()})
 
-            key_components = {"model": ["n_layers", "d_hidden", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+            key_components = {"model": ["n_layers", "d_enc_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head", "take_last_h"], "train": ["learning_rate", "batch_size", "max_epochs"]}
             config_name = ""
             for key in key_components.keys():
                 for component in key_components[key]:
@@ -279,13 +288,13 @@ if __name__=="__main__":
         train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
 
-        batch_size_for_test = 128 if len(test_dataset) > 128 else len(test_dataset)
+        batch_size_for_test = 16 if len(test_dataset) > 16 else len(test_dataset)
         test_loader = DataLoader(test_dataset, batch_size=batch_size_for_test, shuffle=False, num_workers=0)
-        batch_size_for_validation = 128 if len(whole_dataset) > 128 else len(whole_dataset)
+        batch_size_for_validation = 16 if len(whole_dataset) > 16 else len(whole_dataset)
         whole_loader = DataLoader(whole_dataset, batch_size=batch_size_for_validation, shuffle=False, num_workers=0)
 
         ## Load best model or train model
-        final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
+        final_model = build_model(configs.model, tokenizers=tech_dataset.tokenizers)
         if re.search("^1.", torch.__version__) is not None:
             model_size = sum(t.numel() for t in final_model.module.parameters())
             print(f"Model size: {model_size/1000**2:.1f}M paramaters")
@@ -334,7 +343,7 @@ if __name__=="__main__":
                     trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
                 else:
                     trues_recon_kw_train = None
-                eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizer)
+                eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizers["dec"])
                 eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[whole_idx].index)+[""])
         else:
             eval_recon_train = eval_y_train = confmat_y_train = None
@@ -359,7 +368,7 @@ if __name__=="__main__":
             else:
                 trues_recon_kw_test = None
             preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
-            eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, recon_kw=trues_recon_kw_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizer)
+            eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, recon_kw=trues_recon_kw_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizers["dec"])
             eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])
             # eval_recon_res = pd.concat([eval_recon_train, eval_recon_test], axis=0)
 
@@ -389,7 +398,7 @@ if __name__=="__main__":
             json.dump(configs_to_save, f, indent=4)
 
     else:
-        final_model = build_model(configs.model, tokenizer=tech_dataset.tokenizer)
+        final_model = build_model(configs.model, tokenizers=tech_dataset.tokenizers)
         if os.path.exists(final_model_path):
             best_states = torch.load(final_model_path)
         else:

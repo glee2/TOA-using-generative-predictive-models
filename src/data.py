@@ -2,11 +2,11 @@
 '''
 Author: Gyumin Lee
 Version: 1.0
-Description (primary changes): Last version before integration into master branch
+Description (primary changes): Class to class
 '''
 
 # Set root directory
-root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/class2class/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
@@ -37,6 +37,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.normalizers import NFD, Lowercase, StripAccents
 from tokenizers.processors import TemplateProcessing
 from transformers import DistilBertTokenizer
+from transformers import T5Tokenizer
 
 # Text cleaning libraries
 import nltk
@@ -57,7 +58,7 @@ class TechDataset(Dataset):
         self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
         self.target_classes = None
         self.data = self.preprocess()
-        self.tokenizer = self.get_tokenizer()
+        self.tokenizers = self.get_tokenizers()
         self.original_idx = np.array(self.data.index)
         self.X, self.Y, self.Y_digitized = self.make_io()
         self.n_outputs = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
@@ -103,52 +104,62 @@ class TechDataset(Dataset):
 
         return data
 
-    def get_tokenizer(self):
-        if self.is_pretrained:
-            tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-            def custom_token_to_id(self): return self.convert_tokens_to_ids
-            tokenizer.token_to_id = custom_token_to_id(tokenizer)
-            # def custom_get_vocab_size(self): return self.vocab_size
-            # tokenizer.get_vocab_size = partial(custom_get_vocab_size, tokenizer)
-            def custom_decode_batch(self): return self.batch_decode
-            tokenizer.decode_batch = custom_decode_batch(tokenizer)
-            def custom_encode_batch(self): return self.encode
-            tokenizer.encode_batch = custom_encode_batch(tokenizer)
-        else:
-            train_tokenizer = False
-            tokenizer_path = os.path.join(self.data_dir, f"tokenizer_vocab[{self.vocab_size}].json")
-            if self.use_pretrained_tokenizer:
-                if os.path.exists(tokenizer_path):
-                    tokenizer = Tokenizer.from_file(tokenizer_path)
-                else:
-                    print("Pretrained tokenizer file is not found, train new tokenizer")
-                    train_tokenizer = True
-            else:
-                train_tokenizer = True
+    def train_custom_tokenizer(self):
+        tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
+        trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
+        tokenizer.pre_tokenizer = Whitespace()
+        tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
+        tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
+        tokenizer.post_processor = TemplateProcessing(
+            single="<SOS> $A <EOS>",
+            special_tokens=[
+                ("<SOS>", tokenizer.token_to_id("<SOS>")),
+                ("<EOS>", tokenizer.token_to_id("<EOS>")),
+            ],
+        )
+        tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len)
+        if self.max_seq_len > 0:
+            tokenizer.enable_truncation(max_length=self.max_seq_len)
+        tokenizer.vocab_size = tokenizer.get_vocab_size()
+        print("Tokenizer is trained and saved")
 
-            if train_tokenizer:
-                tokenizer = Tokenizer(WordPiece(unk_token="<UNK>"))
-                trainer = WordPieceTrainer(vocab_size=self.vocab_size, special_tokens=["<SOS>", "<PAD>", "<EOS>", "<UNK>"], show_progress=True)
-                tokenizer.pre_tokenizer = Whitespace()
-                tokenizer.normalizer = normalizers.Sequence([NFD(), Lowercase(), StripAccents()])
-                tokenizer.train_from_iterator(self.data['claims'], trainer=trainer)
-                tokenizer.post_processor = TemplateProcessing(
-                    single="<SOS> $A <EOS>",
-                    special_tokens=[
-                        ("<SOS>", tokenizer.token_to_id("<SOS>")),
-                        ("<EOS>", tokenizer.token_to_id("<EOS>")),
-                    ],
-                )
-                tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len)
-                if self.max_seq_len > 0:
-                    tokenizer.enable_truncation(max_length=self.max_seq_len)
-                tokenizer.vocab_size = tokenizer.get_vocab_size()
-                tokenizer.save(tokenizer_path)
-                print("Tokenizer is trained and saved")
-
-            tokenizer.decoder = decoders.WordPiece()
+        tokenizer.decoder = decoders.WordPiece()
 
         return tokenizer
+
+    def get_tokenizers(self):
+        def custom_token_to_id(self): return self.convert_tokens_to_ids
+        def custom_decode_batch(self): return self.batch_decode
+        def custom_encode_batch(self): return self.encode
+        if self.pretrained_enc:
+            enc_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+            enc_tokenizer.token_to_id = custom_token_to_id(enc_tokenizer)
+            enc_tokenizer.decode_batch = custom_decode_batch(enc_tokenizer)
+            enc_tokenizer.encode_batch = custom_encode_batch(enc_tokenizer)
+            # enc_tokenizer.bos_token = "<SOS>"
+            # enc_tokenizer.eos_token = "<EOS>"
+            # enc_tokenizer.pad_token = "<PAD>"
+            # enc_tokenizer.unk_token = "<UNK>"
+        else:
+            enc_tokenizer = self.train_custom_tokenizer()
+        if self.pretrained_dec:
+            dec_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+            dec_tokenizer.token_to_id = custom_token_to_id(dec_tokenizer)
+            dec_tokenizer.decode_batch = custom_decode_batch(dec_tokenizer)
+            dec_tokenizer.encode_batch = custom_encode_batch(dec_tokenizer)
+            # dec_tokenizer.bos_token = "<SOS>"
+            # dec_tokenizer.eos_token = "<EOS>"
+            # dec_tokenizer.pad_token = "<PAD>"
+            # dec_tokenizer.unk_token = "<UNK>"
+        else:
+            if self.pretrained_enc:
+                dec_tokenizer = enc_tokenizer
+            else:
+                dec_tokenizer = self.train_custom_tokenizer()
+
+        tokenizers = {"enc": enc_tokenizer, "dec": dec_tokenizer}
+
+        return tokenizers
 
     def extract_keywords(self, claims):
         cleaner = CleanTransformer(
@@ -185,30 +196,28 @@ class TechDataset(Dataset):
 
         return X, Y, Y_digitized
 
+    def tokenize(self, tokenizer, texts):
+        if str(tokenizer.__class__).split("\'")[1].split(".")[0] == "transformers": # Tokenizer for pretrained language models
+            tokenized = tokenizer(texts, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+            tokenized_dict = {"input_ids": torch.tensor(tokenized["input_ids"], dtype=torch.long),
+                                 "attention_mask": torch.tensor(tokenized["attention_mask"], dtype=torch.long)}
+            # tokenized_dict = {"input_ids": tokenized["input_ids"].to(dtype=torch.long),
+            #                     "attention_mask": tokenized["attention_mask"].to(dtype=torch.long)}
+        elif str(tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers": # Custom tokenizer
+            tokenized = tokenizer.encode(texts) if isinstance(texts, str) else tokenizer.encode_batch(texts)
+            tokenized_dict = {"input_ids": torch.tensor(tokenized.ids, dtype=torch.long),
+                                 "attention_mask": torch.tensor(tokenized.attention_mask, dtype=torch.long)}
+        return tokenized_dict
+
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         input_claims = self.extract_keywords([self.X[idx]])[0] if self.use_keywords else self.X[idx]
         output_claims = self.X[idx]
-        if str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "transformers": # Tokenizer for pretrained language models
-            text_inputs = self.tokenizer(input_claims, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
-            text_inputs_dict = {"input_ids": torch.tensor(text_inputs["input_ids"], dtype=torch.long),
-                                "attention_mask": torch.tensor(text_inputs["attention_mask"], dtype=torch.long)}
-            if self.use_keywords:
-                text_outputs = self.tokenizer(output_claims, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
-                text_outputs_dict = {"input_ids": torch.tensor(text_outputs["input_ids"], dtype=torch.long),
-                                     "attention_mask": torch.tensor(text_outputs["attention_mask"], dtype=torch.long)}
-            else:
-                text_outputs_dict = text_inputs_dict
-        elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers": # Custom tokenizer
-            text_inputs = self.tokenizer.encode(input_claims) if isinstance(input_claims, str) else self.tokenizer.encode_batch(input_claims)
-            text_inputs_dict = {"input_ids": torch.tensor(text_inputs.ids, dtype=torch.long), "attention_mask": torch.tensor(text_inputs.attention_mask, dtype=torch.long)}
-            if self.use_keywords:
-                text_outputs = self.tokenizer.encode(output_claims)
-                text_outputs_dict = {"input_ids": torch.tensor(text_outputs.ids, dtype=torch.long), "attention_mask": torch.tensor(text_outputs.attention_mask, dtype=torch.long)}
-            else:
-                text_outputs_dict = text_inputs_dict
+
+        text_inputs_dict = self.tokenize(self.tokenizers["enc"], input_claims)
+        text_outputs_dict = self.tokenize(self.tokenizers["dec"], output_claims)
 
         target_dtype = torch.long if self.pred_type=="classification" else torch.float32
         target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
