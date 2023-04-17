@@ -13,6 +13,7 @@ import threading
 import functools
 import torch
 from torch.autograd import Variable, Function
+from itertools import chain
 import torch.cuda.comm as comm
 from torch.nn.parallel.data_parallel import DataParallel
 from torch.nn.parallel.parallel_apply import get_a_var
@@ -95,6 +96,31 @@ class DataParallelModel(DataParallel):
         >>> net = encoding.nn.DataParallelModel(model, device_ids=[0, 1, 2])
         >>> y = net(x)
     """
+
+    def forward(self, *inputs, **kwargs):
+        with torch.autograd.profiler.record_function("DataParallel.forward"):
+            if not self.device_ids:
+                return self.module(*inputs, **kwargs)
+
+            for t in chain(self.module.parameters(), self.module.buffers()):
+                if t.device != self.src_device_obj:
+                    raise RuntimeError("module must have its parameters and buffers "
+                                       "on device {} (device_ids[0]) but found one of "
+                                       "them on device: {}".format(self.src_device_obj, t.device))
+
+            inputs, kwargs = self.scatter(inputs, kwargs, self.device_ids)
+            # for forward function without any inputs, empty list and dict will be created
+            # so the module can be executed on one device which is the first one in device_ids
+            if not inputs and not kwargs:
+                inputs = ((),)
+                kwargs = ({},)
+
+            if len(self.device_ids) == 1:
+                return self.module(*inputs[0], **kwargs[0])
+            replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
+            outputs = self.parallel_apply(replicas, inputs, kwargs)
+            return self.gather(outputs, self.output_device)
+
     def gather(self, outputs, output_device):
         return outputs
 
@@ -133,6 +159,7 @@ class DataParallelCriterion(DataParallel):
             return self.module(inputs, *targets[0], **kwargs[0])
         replicas = self.replicate(self.module, self.device_ids[:len(inputs)])
         outputs = _criterion_parallel_apply(replicas, inputs, targets, kwargs)
+        out = Reduce.apply(*outputs)
         return Reduce.apply(*outputs) / len(outputs)
 
 def _criterion_parallel_apply(modules, inputs, targets, kwargs_tup=None, devices=None):

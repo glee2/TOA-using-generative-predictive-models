@@ -22,6 +22,7 @@ from collections.abc import Iterable
 import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from torch.nn.modules.loss import _Loss
 import sklearn
 from sklearn.metrics import confusion_matrix
 
@@ -32,6 +33,17 @@ def to_device(x, device):
         return {k: v.to(device) for k,v in x.items()}
     elif isinstance(x, torch.Tensor):
         return x.to(device)
+
+def loss_KLD(mu, logvar):
+    return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+class KLDLoss(_Loss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = "mean", log_target: bool = False) -> None:
+        super().__init__(size_average, reduce, reduction)
+        self.log_target = log_target
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return loss_KLD(input, target)
 
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")):
     """Filter a distribution of logits using top-k and/or nucleus (top-p) filtering

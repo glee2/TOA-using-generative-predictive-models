@@ -1,7 +1,7 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.0
+Version: 1.1
 Description (primary changes): Class to class
 '''
 
@@ -51,7 +51,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 class TechDataset(Dataset):
     def __init__(self, config):
         super().__init__()
-
+        self.config = config
         for key, value in config.items():
             setattr(self, key, value)
 
@@ -68,7 +68,7 @@ class TechDataset(Dataset):
         latest_year = datetime.datetime.now().year-1
         cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
-        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc','claims'])[['number','main ipc','sub ipc','claims']]
+        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc', 'sub ipc', 'claims'])[['number','main ipc','sub ipc','claims']]
         if self.target_ipc == "ALL":
             main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
         else:
@@ -76,7 +76,27 @@ class TechDataset(Dataset):
             ## temporarily
             main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
         assert len(main_ipcs) != 0, "target ipc is not observed"
-        data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+
+        if self.data_type == "class" or self.data_type in ["class+claim", "claim+class"]:
+            data = rawdata_dropna[["number"]].copy(deep=True)
+
+            assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
+            if self.ipc_level == 1:
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:3])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
+            elif self.ipc_level == 2:
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
+            elif self.ipc_level == 3:
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x)
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx for xx in x.split(";")])))
+            data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
+            seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
+            self.max_seq_len = seq_len if self.max_seq_len < seq_len else self.max_seq_len
+            if self.data_type in ["class+claim", "claim+class"]:
+                data["claims"] = rawdata_dropna.loc[data.index]["claims"]
+        elif self.data_type == "claim":
+            data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
 
         rawdata_tc = self.rawdata.loc[data.index]
 
@@ -88,8 +108,10 @@ class TechDataset(Dataset):
         bins_criterion = [data["TC"+str(self.n_TC)].quantile(0.9)]
         data["TC"+str(self.n_TC)+"_digitized"] = pd.Series(np.digitize(data["TC"+str(self.n_TC)].values, bins=bins_criterion, right=True))
 
+        # return data
+
         ## Get patent class
-        patent_classes = data["main ipc"].apply(lambda x: x[:self.class_level]).values
+        patent_classes = data["main_ipc"].apply(lambda x: x[:self.class_level]).values
         label_encoder = LabelEncoder()
         label_encoder.fit(patent_classes)
         data["class"] = pd.Series(label_encoder.fit_transform(patent_classes))
@@ -128,34 +150,31 @@ class TechDataset(Dataset):
         return tokenizer
 
     def get_tokenizers(self):
-        def custom_token_to_id(self): return self.convert_tokens_to_ids
-        def custom_decode_batch(self): return self.batch_decode
-        def custom_encode_batch(self): return self.encode
-        if self.pretrained_enc:
-            enc_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-            enc_tokenizer.token_to_id = custom_token_to_id(enc_tokenizer)
-            enc_tokenizer.decode_batch = custom_decode_batch(enc_tokenizer)
-            enc_tokenizer.encode_batch = custom_encode_batch(enc_tokenizer)
-            # enc_tokenizer.bos_token = "<SOS>"
-            # enc_tokenizer.eos_token = "<EOS>"
-            # enc_tokenizer.pad_token = "<PAD>"
-            # enc_tokenizer.unk_token = "<UNK>"
-        else:
-            enc_tokenizer = self.train_custom_tokenizer()
-        if self.pretrained_dec:
-            dec_tokenizer = T5Tokenizer.from_pretrained("t5-small")
-            dec_tokenizer.token_to_id = custom_token_to_id(dec_tokenizer)
-            dec_tokenizer.decode_batch = custom_decode_batch(dec_tokenizer)
-            dec_tokenizer.encode_batch = custom_encode_batch(dec_tokenizer)
-            # dec_tokenizer.bos_token = "<SOS>"
-            # dec_tokenizer.eos_token = "<EOS>"
-            # dec_tokenizer.pad_token = "<PAD>"
-            # dec_tokenizer.unk_token = "<UNK>"
-        else:
+        if self.data_type == "claim":
+            def custom_token_to_id(self): return self.convert_tokens_to_ids
+            def custom_decode_batch(self): return self.batch_decode
+            def custom_encode_batch(self): return self.encode
             if self.pretrained_enc:
-                dec_tokenizer = enc_tokenizer
+                enc_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+                enc_tokenizer.token_to_id = custom_token_to_id(enc_tokenizer)
+                enc_tokenizer.decode_batch = custom_decode_batch(enc_tokenizer)
+                enc_tokenizer.encode_batch = custom_encode_batch(enc_tokenizer)
             else:
-                dec_tokenizer = self.train_custom_tokenizer()
+                enc_tokenizer = self.train_custom_tokenizer()
+
+            if self.pretrained_dec:
+                dec_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+                dec_tokenizer.token_to_id = custom_token_to_id(dec_tokenizer)
+                dec_tokenizer.decode_batch = custom_decode_batch(dec_tokenizer)
+                dec_tokenizer.encode_batch = custom_encode_batch(dec_tokenizer)
+            else:
+                if self.pretrained_enc:
+                    dec_tokenizer = enc_tokenizer
+                else:
+                    dec_tokenizer = self.train_custom_tokenizer()
+        elif self.data_type == "class":
+            enc_tokenizer = PatentClassTokenizer(self.data, max_len=self.max_seq_len)
+            dec_tokenizer = enc_tokenizer
 
         tokenizers = {"enc": enc_tokenizer, "dec": dec_tokenizer}
 
@@ -177,11 +196,15 @@ class TechDataset(Dataset):
         return cleaned
 
     def make_io(self, val_main=10, val_sub=1):
-        claim_separator = "\n\n\n"
-        if self.claim_level != -1:
-            X = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
-        else:
-            X = self.data["claims"]
+        if self.data_type == "class":
+            X = self.data["ipcs"]
+            # X = self.tokenizers["enc"].encode_batch(self.data["ipcs"])
+        elif self.data_type == "claim":
+            claim_separator = "\n\n\n"
+            if self.claim_level != -1:
+                X = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
+            else:
+                X = self.data["claims"]
 
         if self.target_type == "citation":
             Y_digitized = self.data["TC"+str(self.n_TC)+"_digitized"]
@@ -213,11 +236,17 @@ class TechDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        input_claims = self.extract_keywords([self.X[idx]])[0] if self.use_keywords else self.X[idx]
-        output_claims = self.X[idx]
+        if self.data_type == "class":
+            input_classes = self.X[idx]
+            output_claims = input_classes
+            text_inputs_dict = torch.tensor(self.tokenizers["enc"].encode(input_classes), dtype=torch.long)
+            text_outputs_dict = text_inputs_dict
+        elif self.data_type == "claim":
+            input_claims = self.extract_keywords([self.X[idx]])[0] if self.use_keywords else self.X[idx]
+            output_claims = self.X[idx]
 
-        text_inputs_dict = self.tokenize(self.tokenizers["enc"], input_claims)
-        text_outputs_dict = self.tokenize(self.tokenizers["dec"], output_claims)
+            text_inputs_dict = self.tokenize(self.tokenizers["enc"], input_claims)
+            text_outputs_dict = self.tokenize(self.tokenizers["dec"], output_claims)
 
         target_dtype = torch.long if self.pred_type=="classification" else torch.float32
         target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
@@ -225,6 +254,62 @@ class TechDataset(Dataset):
         out = {"text_inputs": text_inputs_dict, "text_outputs": text_outputs_dict, "targets": target_outputs}
 
         return out
+
+class PatentClassTokenizer():
+    def __init__(self, ipc_data, max_len=100):
+        self.ipcs = ipc_data["ipcs"].values
+        self.max_len = max_len
+        self.sos_token = "<SOS>"
+        self.pad_token = "<PAD>"
+        self.eos_token = "<EOS>"
+        self.unk_token = "<UNK>"
+        self.set_vocabulary()
+
+    def set_vocabulary(self):
+        self.vocabulary = np.unique(np.concatenate(self.ipcs))
+        self.special_tokens = [self.sos_token, self.pad_token, self.eos_token, self.unk_token]
+        self.vocab_w2i = {self.special_tokens[i]: i for i in range(len(self.special_tokens))}
+        self.vocab_w2i.update({self.vocabulary[i]: len(self.special_tokens)+i for i in range(len(self.vocabulary))})
+        self.vocab_i2w = {i: self.special_tokens[i] for i in range(len(self.special_tokens))}
+        self.vocab_i2w.update({len(self.special_tokens)+i: self.vocabulary[i] for i in range(len(self.vocabulary))})
+        self.vocab_size = len(self.vocabulary) + len(self.special_tokens)
+
+    def token_to_id(self, token):
+        try:
+            out = self.vocab_w2i[token]
+        except:
+            out = self.vocab_w2i[self.unk_token]
+        return out
+
+    def encode(self, tokens):
+        # if not isinstance(tokens, list): tokens = [tokens]
+        if isinstance(tokens, int) or isinstance(tokens, str): tokens = [tokens]
+        out = [self.token_to_id(self.sos_token)] + [self.token_to_id(token) for token in tokens]
+        if len(out) < self.max_len:
+            out = out + [self.token_to_id(self.eos_token)] + [self.token_to_id(self.pad_token) for _ in range(self.max_len - len(out) - 1)]
+        return out
+
+    def id_to_token(self, id):
+        try:
+            out = self.vocab_i2w[id]
+        except:
+            out = self.unk_token
+        return out
+
+    def decode(self, ids):
+        # if not isinstance(ids, list) or not isinstance(ids, np.ndarray): ids = [ids]
+        if isinstance(ids, int) or isinstance(ids, str): ids = [ids]
+        out = [self.id_to_token(id) for id in ids]
+        return out
+
+    def get_vocab_size(self):
+        return self.vocab_size
+
+    def encode_batch(self, batch):
+        return [self.encode(row) for row in batch]
+
+    def decode_batch(self, batch):
+        return [self.decode(row) for row in batch]
 
 class CVSampler:
     def __init__(self, dataset, test_ratio=0.2, val_ratio=0.2, n_folds=5, random_state=10, stratify=False, oversampled=False):

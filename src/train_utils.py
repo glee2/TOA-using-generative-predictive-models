@@ -36,8 +36,8 @@ from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
-from models import Transformer
-from utils import token2class, print_gpu_memcheck, to_device
+from models import Transformer, SEQ2SEQ
+from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 ON_IPYTHON = True
@@ -110,7 +110,8 @@ def build_model(model_params={}, trial=None, tokenizers=None):
         model_params['d_head'] = trial.suggest_categorical("d_head", [x for x in np.arange(model_params["for_tune"]["min_d_head"],model_params["for_tune"]["max_d_head"]+1,step=model_params["for_tune"]["min_d_head"]) if model_params["for_tune"]["max_d_head"]%x==0])
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_enc_seq'], model_params['d_hidden'] * model_params['n_enc_seq'])
 
-    model = Transformer(model_params, tokenizers=tokenizers).to(device)
+    # model = Transformer(model_params, tokenizers=tokenizers).to(device)
+    model = SEQ2SEQ(model_params, tokenizers=tokenizers).to(device)
     if re.search("^2.", torch.__version__) is not None:
         print("INFO: PyTorch 2.* imported, compile model")
         model = torch.compile(model)
@@ -133,14 +134,16 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss()
     # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
     # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCELoss()
+    loss_kld = KLDLoss()
 
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
+    loss_kld = DataParallelCriterion(loss_kld, device_ids=model_params["device_ids"])
 
     if model_params["model_type"] == "enc-pred-dec":
-        loss_f = {"recon": loss_recon, "y": loss_y}
+        loss_f = {"recon": loss_recon, "y": loss_y, "KLD": loss_kld}
     elif model_params["model_type"] == "enc-dec":
-        loss_f = {"recon": loss_recon}
+        loss_f = {"recon": loss_recon, "KLD": loss_KLD}
     elif model_params["model_type"] == "enc-pred":
         loss_f = {"y": loss_y}
     else:
@@ -215,6 +218,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0}
 
         for i, batch_data in tqdm(enumerate(data_loader)):
+            # batch_data = {"text_inputs": to_device(batch_data["text_inputs"], device), "text_outputs": to_device(batch_data["text_outputs"], device), "targets": to_device(batch_data["targets"], device)}
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
 
             optimizer.zero_grad()
@@ -223,28 +227,37 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                     with record_function("model_feedforward"):
                         outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
-                        outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                        outputs_recon = [output["dec_outputs"].permute(0,2,1) for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                         outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                         outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
-                        dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                        outputs_mu = [output["mu"] for output in outputs]
+                        outputs_logvar = [output["logvar"] for output in outputs]
+                        # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                        dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
             else:
                 outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
-                outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                outputs_recon = [output["dec_outputs"].permute(0,2,1) for output in outputs] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => outputs_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
                 outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                 outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
-                dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                outputs_mu = [output["mu"] for output in outputs]
+                outputs_logvar = [output["logvar"] for output in outputs]
+                # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Forward pass")
 
             if "dec" in model_params["model_type"]:
-                preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
-                trues_recon = batch_data["text_outputs"]["input_ids"][:,1:] # omit <sos> from target sequence
+                # preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
+                preds_recon = dict_outputs["recon"]
+                trues_recon = batch_data["text_outputs"] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
+                preds_mu = dict_outputs["mu"]
+                preds_logvar = torch.cat([t.to(device) for t in dict_outputs["logvar"]])
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
                 trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
             if model_params["model_type"] == "enc-pred-dec":
-                loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
+                loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon) + loss_f["KLD"](preds_mu, preds_logvar)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
                     if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
@@ -260,7 +273,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss = loss_y
                 dict_epoch_losses["y"] += loss_y.item()
             elif model_params["model_type"] == "enc-recon":
-                loss_recon = loss_f["recon"](preds_recon, trues_recon)
+                loss_recon = loss_f["recon"](preds_recon, trues_recon) + loss_f["KLD"](mu=dict_outputs["mu"], logvar=dict_outputs["logvar"])
                 loss = loss_recon
                 dict_epoch_losses["recon"] += loss_recon.item()
 
@@ -299,26 +312,35 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                         with record_function("model_feedforward"):
                             outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
-                            outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                            outputs_recon = [output["dec_outputs"].permute(0,2,1) for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                             outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                             outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
-                            dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                            outputs_mu = [output["mu"] for output in outputs]
+                            outputs_logvar = [output["logvar"] for output in outputs]
+                            # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                            dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
                 else:
                     outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
-                    outputs_recon = [output["dec_outputs"] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
+                    outputs_recon = [output["dec_outputs"].permute(0,2,1) for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                     outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                     outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
-                    dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                    outputs_mu = [output["mu"] for output in outputs]
+                    outputs_logvar = [output["logvar"] for output in outputs]
+                    # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
+                    dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
 
                 if "dec" in model_params["model_type"]:
-                    preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
-                    trues_recon = batch_data["text_outputs"]["input_ids"][:,1:] # omit <sos> from target sequence
+                    # preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
+                    preds_recon = dict_outputs["recon"]
+                    trues_recon = batch_data["text_outputs"] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
+                    preds_mu = dict_outputs["mu"]
+                    preds_logvar = torch.cat([t.to(device) for t in dict_outputs["logvar"]])
                 if "pred" in model_params["model_type"]:
                     preds_y = dict_outputs["y"]
                     trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
                 if model_params["model_type"] == "enc-pred-dec":
-                    loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
+                    loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon) + loss_f["KLD"](preds_mu, preds_logvar)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
                         # if epoch > int(train_params["max_epochs"] * 0.9):
@@ -337,7 +359,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss = loss_y
                     dict_epoch_losses["y"] += loss_y.item()
                 elif model_params["model_type"] == "enc-recon":
-                    loss_recon = loss_f["recon"](preds_recon, trues_recon)
+                    loss_recon = loss_f["recon"](preds_recon, trues_recon) + loss_f["KLD"](mu=dict_outputs["mu"], logvar=dict_outputs["logvar"])
                     loss_y = torch.tensor(0)
                     loss = loss_recon
                     dict_epoch_losses["recon"] += loss_recon.item()
@@ -386,17 +408,24 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
     model.device = curr_device
     with torch.no_grad():
         data_loader = queue_dataloader.get()
+        batch_size = data_loader.batch_size
         trues_recon, trues_recon_kw, trues_y = [], [], []
         preds_recon, preds_y = [], []
 
         # for batch, (X_batch, Y_batch) in tqdm(enumerate(data_loader)):
         for batch, batch_data in tqdm(enumerate(data_loader)):
-            trues_recon.append(batch_data["text_outputs"]["input_ids"][:,1:].cpu().detach().numpy())
-            trues_recon_kw.append(batch_data["text_inputs"]["input_ids"][:,1:].cpu().detach().numpy())
+            # trues_recon.append(batch_data["text_outputs"]["input_ids"][:,1:].cpu().detach().numpy())
+
+            trues_recon_batch = batch_data["text_outputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
+            trues_recon.append(trues_recon_batch.cpu().detach().numpy())
+
+            trues_recon_kw_batch = batch_data["text_inputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_inputs"]["input_ids"][:,1:]
+            trues_recon_kw.append(trues_recon_kw_batch.cpu().detach().numpy())
             trues_y.append(batch_data["targets"].cpu().detach().numpy())
 
             text_inputs = to_device(batch_data["text_inputs"], curr_device)
-            z = model.encode(text_inputs)
+            # z = model.encode(text_inputs)
+            enc_outputs, z, mu, logvar = model.encode(text_inputs)
 
             # enc_inputs = {"input_ids": batch_data["text_inputs"]["input_ids"].to(device=curr_device), "attention_mask": batch_data["text_inputs"]["attention_mask"].to(device=curr_device)}
             # if model_params["is_pretrained"]:
@@ -411,7 +440,9 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
                 preds_y.append(preds_y_batch.cpu().detach().numpy())
 
             if "dec" in model_params["model_type"]:
-                preds_recon_batch = model.decode(z=z)
+                # preds_recon_batch = model.decode(z=z)
+                preds_recon_batch = model.decode(z, enc_outputs, device=curr_device)
+                preds_recon_batch = preds_recon_batch.argmax(2)
                 # preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
                 # for i in range(model_params['n_dec_seq']-1):
                 #     dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
@@ -433,50 +464,6 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
 
         ret_dict[device_rank]["recon"] = {"true": trues_recon, "pred": preds_recon, "kw": trues_recon_kw}
         ret_dict[device_rank]["y"] = {"true": trues_y, "pred": preds_y}
-
-def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
-    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
-    loss_y = torch.nn.MSELoss()
-
-    loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
-    loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
-
-    if model_params['use_predictor']:
-        loss_f = {"recon": loss_recon, "y": loss_y}
-    else:
-        loss_f = {"recon": loss_recon}
-
-    scores, trained_models = [], []
-    for fold in tqdm(range(train_params['n_folds'])):
-        train_dataset = Subset(dataset, cv_idx[fold]['train'])
-        val_dataset = Subset(dataset, cv_idx[fold]['val'])
-        test_dataset = Subset(dataset, cv_idx[fold]['test'])
-        min_batch_size = 16
-        max_batch_size = 1024 if len(val_dataset) > 1024 else len(val_dataset)
-
-        model_params_obj = copy.deepcopy(model_params)
-        train_params_obj = copy.deepcopy(train_params)
-
-        train_params_obj['batch_size'] = trial.suggest_int("batch_size", min_batch_size, max_batch_size, step=train_params['n_gpus'])
-
-        train_loader = DataLoader(train_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
-        test_loader = DataLoader(test_dataset, batch_size=min_batch_size, shuffle=True, num_workers=0, drop_last=False)
-
-        model = build_model(model_params_obj, trial=trial)
-        model = train_model(model, train_loader, val_loader, model_params_obj, train_params_obj, trial=trial)
-
-        test_loss = run_epoch(test_loader, model, loss_f=loss_f, mode='test', train_params=train_params_obj, model_params=model_params_obj)
-
-        scores.append(test_loss["y"])
-        trained_models.append(model)
-        torch.cuda.empty_cache()
-
-    best_model = trained_models[np.argmin(scores)].module
-    torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_dir'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
-    torch.cuda.empty_cache()
-
-    return np.mean(scores)
 
 def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='regression', tokenizer=None, custom_weight=None):
     if pred_type == 'classification':
@@ -536,8 +523,10 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         assert configs is not None, "Configuration is needed to evaulate Generative model"
         assert tokenizer is not None, "Tokenizer is needed to convert ids to tokens"
 
-        trues_claims = pd.Series(tokenizer.decode_batch(trues))
-        preds_claims = pd.Series(tokenizer.decode_batch(preds, skip_special_tokens=False)).apply(lambda x: x.split(tokenizer.eos_token)[0])
+        # trues_claims = pd.Series(tokenizer.decode_batch(trues))
+        trues_claims = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
+        # preds_claims = pd.Series(tokenizer.decode_batch(preds, skip_special_tokens=False)).apply(lambda x: x.split(tokenizer.eos_token)[0])
+        preds_claims = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
         BLEU_scores = pd.Series([sentence_bleu([t],p) for t,p in zip(trues_claims.values, preds_claims.values)])
         if recon_kw is not None:
             trues_claims_kw = pd.Series(tokenizer.decode_batch(recon_kw))
@@ -578,3 +567,47 @@ def decom_confmat(cm, c=None):
     output_dict = {"Support": sup, "Accuracy": acc, "Precision": pre, "Recall": rec, "F1 score": f1, "Specificity": spe, "NPV": npv, "components": {"tp": tp, "tn": tn, "fp": fp, "fn": fn}}
 
     return output_dict
+
+def objective_cv(trial, dataset, cv_idx, model_params={}, train_params={}):
+    loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
+    loss_y = torch.nn.MSELoss()
+
+    loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
+    loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
+
+    if model_params['use_predictor']:
+        loss_f = {"recon": loss_recon, "y": loss_y}
+    else:
+        loss_f = {"recon": loss_recon}
+
+    scores, trained_models = [], []
+    for fold in tqdm(range(train_params['n_folds'])):
+        train_dataset = Subset(dataset, cv_idx[fold]['train'])
+        val_dataset = Subset(dataset, cv_idx[fold]['val'])
+        test_dataset = Subset(dataset, cv_idx[fold]['test'])
+        min_batch_size = 16
+        max_batch_size = 1024 if len(val_dataset) > 1024 else len(val_dataset)
+
+        model_params_obj = copy.deepcopy(model_params)
+        train_params_obj = copy.deepcopy(train_params)
+
+        train_params_obj['batch_size'] = trial.suggest_int("batch_size", min_batch_size, max_batch_size, step=train_params['n_gpus'])
+
+        train_loader = DataLoader(train_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
+        val_loader = DataLoader(val_dataset, batch_size=train_params_obj['batch_size'], shuffle=True, num_workers=0, drop_last=True)
+        test_loader = DataLoader(test_dataset, batch_size=min_batch_size, shuffle=True, num_workers=0, drop_last=False)
+
+        model = build_model(model_params_obj, trial=trial)
+        model = train_model(model, train_loader, val_loader, model_params_obj, train_params_obj, trial=trial)
+
+        test_loss = run_epoch(test_loader, model, loss_f=loss_f, mode='test', train_params=train_params_obj, model_params=model_params_obj)
+
+        scores.append(test_loss["y"])
+        trained_models.append(model)
+        torch.cuda.empty_cache()
+
+    best_model = trained_models[np.argmin(scores)].module
+    torch.save(best_model.state_dict(), os.path.join(train_params_obj['model_dir'],f"[HPARAM_TUNING]{trial.number}trial.ckpt"))
+    torch.cuda.empty_cache()
+
+    return np.mean(scores)

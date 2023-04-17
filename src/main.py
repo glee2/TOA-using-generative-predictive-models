@@ -182,7 +182,10 @@ if __name__=="__main__":
         d_embedding = configs.model.d_embedding
         d_enc_hidden = configs.model.d_enc_hidden
         d_pred_hidden = configs.model.d_pred_hidden
-        # d_latent = configs.model.n_enc_seq * configs.model.d_hidden
+        d_latent = configs.model.d_enc_hidden * configs.model.n_directions
+        d_latent = 64
+
+        configs.model.update({"d_latent": d_latent})
 
         key_components = {"data": ["target_ipc", "max_seq_len", "vocab_size"], "model": ["n_layers", "d_enc_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
         config_name = ""
@@ -191,7 +194,7 @@ if __name__=="__main__":
                 config_name += "["+str(configs[key][component])+component+"]"
         final_model_path = os.path.join(model_dir, f"[Final_model]{config_name}.ckpt")
 
-    # configs.model.update({"d_latent": d_latent})
+
     configs.train.update({"config_name": config_name,
                             "final_model_path": final_model_path})
 
