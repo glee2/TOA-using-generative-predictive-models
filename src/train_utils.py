@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.2
-Description (primary changes): Class to class
+Version: 1.3
+Description (primary changes): Claim + class -> class
 '''
 
 # Set root directory
@@ -36,7 +36,7 @@ from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
-from models import Transformer, SEQ2SEQ
+from models import Transformer, CLS2CLS
 from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -70,9 +70,6 @@ class EarlyStopping:
                 self.early_stop = True
                 # Load latest saved model
                 self.load_model(model)
-                # saved_model = copy.copy(model)
-                # saved_model.load_state_dict(torch.load(self.path))
-                # return saved_model
         else:
             self.best_score = score
             self.save_checkpoint(val_loss, model)
@@ -111,7 +108,7 @@ def build_model(model_params={}, trial=None, tokenizers=None):
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_enc_seq'], model_params['d_hidden'] * model_params['n_enc_seq'])
 
     # model = Transformer(model_params, tokenizers=tokenizers).to(device)
-    model = SEQ2SEQ(model_params, tokenizers=tokenizers).to(device)
+    model = CLS2CLS(model_params, tokenizers=tokenizers).to(device)
     if re.search("^2.", torch.__version__) is not None:
         print("INFO: PyTorch 2.* imported, compile model")
         model = torch.compile(model)
@@ -130,12 +127,8 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'])
-    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.CrossEntropyLoss()
-    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss()
-    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
-    # loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.BCELoss()
+    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss(weight=class_weights)
     loss_kld = KLDLoss()
-
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
     loss_kld = DataParallelCriterion(loss_kld, device_ids=model_params["device_ids"])
@@ -158,7 +151,6 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         max_epochs = train_params['max_epochs']
         early_stop_patience = train_params['early_stop_patience']
 
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=train_params['learning_rate'])
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=train_params['learning_rate'])
 
     ## Accelerator wrapping
@@ -171,18 +163,24 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Before training")
 
+    if model_params["pretrained_enc"]: model.module.freeze_(module_name="claim_encoder")
+    model.module.freeze_(module_name="predictor")
+
     for ep in range(max_epochs):
         epoch_start = time.time()
         print(f"Epoch {ep+1}\n"+str("-"*25))
 
         if model_params["model_type"]=="enc-pred-dec" and train_params["alternate_train"]:
-            # if ep > int(train_params["max_epochs"] * 0.8):
             if ep > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                # model.module.freeze(module="decoder")
-                model.module.defreeze(module="predictor")
+                model.module.freeze_(module_name="decoder")
+                model.module.freeze_(module_name="predictor", defreeze=True)
+                # # model.module.freeze(module="decoder")
+                # model.module.defreeze(module="predictor")
             else:
-                model.module.freeze(module="predictor")
-                model.module.defreeze(module="decoder")
+                model.module.freeze_(module_name="decoder", defreeze=True)
+                model.module.freeze_(module_name="predictor")
+                # model.module.freeze(module="predictor")
+                # model.module.defreeze(module="decoder")
 
         train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
         val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
@@ -218,7 +216,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0}
 
         for i, batch_data in tqdm(enumerate(data_loader)):
-            # batch_data = {"text_inputs": to_device(batch_data["text_inputs"], device), "text_outputs": to_device(batch_data["text_outputs"], device), "targets": to_device(batch_data["targets"], device)}
+            # batch_data = to_device(batch_data, device)
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
 
             optimizer.zero_grad()
@@ -308,6 +306,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
         with torch.no_grad():
             for i, batch_data in tqdm(enumerate(data_loader)):
+                # batch_data = to_device(batch_data, device)
                 if ON_IPYTHON:
                     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                         with record_function("model_feedforward"):
@@ -364,7 +363,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss = loss_recon
                     dict_epoch_losses["recon"] += loss_recon.item()
 
-                # epoch_loss += loss.item()
                 dict_epoch_losses["total"] += loss_recon.item() + loss_y.item()
 
         dict_epoch_losses = {key: (value/len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
@@ -380,10 +378,11 @@ def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params
         batch_size = train_params["batch_size"]
     queue_dataloader = mp.Queue()
     manager = mp.Manager()
-    ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in range(train_params["n_gpus"])})
+    ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in [device_id.index for device_id in train_params["device_ids"]]})
     processes = []
 
-    for device_rank in range(train_params["n_gpus"]):
+    for device_id in train_params["device_ids"]:
+        device_rank = device_id.index
         model_rank = copy.deepcopy(model.module)
         p = mp.Process(name="Subprocess", target=inference_mp, args=(model_rank, device_rank, queue_dataloader, ret_dict, model_params, train_params))
         p.start()
@@ -412,43 +411,29 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
         trues_recon, trues_recon_kw, trues_y = [], [], []
         preds_recon, preds_y = [], []
 
-        # for batch, (X_batch, Y_batch) in tqdm(enumerate(data_loader)):
         for batch, batch_data in tqdm(enumerate(data_loader)):
-            # trues_recon.append(batch_data["text_outputs"]["input_ids"][:,1:].cpu().detach().numpy())
+            batch_data = to_device(batch_data, curr_device)
 
-            trues_recon_batch = batch_data["text_outputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
+            trues_recon_batch = batch_data["text_outputs"] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
             trues_recon.append(trues_recon_batch.cpu().detach().numpy())
 
-            trues_recon_kw_batch = batch_data["text_inputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_inputs"]["input_ids"][:,1:]
+            trues_recon_kw_batch = batch_data["text_inputs"]["claim"]["input_ids"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_inputs"]["input_ids"][:,1:]
             trues_recon_kw.append(trues_recon_kw_batch.cpu().detach().numpy())
             trues_y.append(batch_data["targets"].cpu().detach().numpy())
 
-            text_inputs = to_device(batch_data["text_inputs"], curr_device)
-            # z = model.encode(text_inputs)
-            enc_outputs, z, mu, logvar = model.encode(text_inputs)
-
-            # enc_inputs = {"input_ids": batch_data["text_inputs"]["input_ids"].to(device=curr_device), "attention_mask": batch_data["text_inputs"]["attention_mask"].to(device=curr_device)}
-            # if model_params["is_pretrained"]:
-            #     enc_outputs_base = model.encoder(**enc_inputs)
-            #     enc_outputs, enc_self_attn_probs = enc_outputs_base.last_hidden_state, enc_outputs_base.attentions
-            # else:
-            #     enc_outputs, *_ = model.encoder(**enc_inputs)
+            enc_outputs, z, mu, logvar = model.encode(batch_data["text_inputs"])
 
             if "pred" in model_params["model_type"]:
                 preds_y_batch = model.predict(z)
+                if len(preds_y_batch.size()) > 2 and preds_y_batch.size(1) == 1: preds_y_batch = preds_y_batch.squeeze(0)
+                # print(z.shape)
                 # preds_y_batch = model.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
                 preds_y.append(preds_y_batch.cpu().detach().numpy())
 
             if "dec" in model_params["model_type"]:
-                # preds_recon_batch = model.decode(z=z)
-                preds_recon_batch = model.decode(z, enc_outputs, device=curr_device)
+                preds_recon_batch = model.decode(z, enc_outputs["class"], device=curr_device)
                 preds_recon_batch = preds_recon_batch.argmax(2)
-                # preds_recon_batch = torch.tile(torch.tensor(model_params['tokenizer'].token_to_id("<SOS>"), device=curr_device), dims=(batch_data["text_outputs"]["input_ids"].shape[0],1)).to(device=curr_device)
-                # for i in range(model_params['n_dec_seq']-1):
-                #     dec_outputs, *_ = model.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
-                #     pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
-                #     preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
-                preds_recon.append(preds_recon_batch[:,1:].cpu().detach().numpy())
+                preds_recon.append(preds_recon_batch.cpu().detach().numpy())
 
         if "pred" in model_params["model_type"]:
             trues_y = np.concatenate(trues_y)

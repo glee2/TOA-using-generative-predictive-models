@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.1
-Description (primary changes): Class to class
+Version: 1.2
+Description (primary changes): Claim + class -> class
 '''
 
 # Set root directory
@@ -165,39 +165,41 @@ class EncoderLayer(nn.Module):
 
         return ffn_outputs, attn_prob
 
-class Encoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.device = self.config.device
-
-        self.enc_emb = nn.Embedding(self.config.n_enc_vocab, self.config.d_hidden).to(self.device)
-        sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_enc_seq + 1, self.config.d_hidden), dtype=torch.float64).to(self.device)
-        self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True).to(self.device)
-
-        self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config.n_layers)])
-
-    def forward(self, input_ids, attention_mask):
-        # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
-
-        inputs = input_ids
-
-        positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
-        pos_mask = inputs.eq(self.config.i_padding)
-        positions.masked_fill_(pos_mask, 0)
-
-        outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
-        outputs = outputs.to(dtype=torch.float32)
-
-        attn_mask = get_pad_mask(inputs, inputs, self.config.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
-
-        attn_probs = []
-        for layer in self.layers:
-            outputs, attn_prob = layer(outputs, attn_mask)
-            # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
-            attn_probs.append(attn_prob)
-
-        return outputs, attn_probs
+# class Encoder(nn.Module):
+#     def __init__(self, config, tokenizer=None):
+#         super().__init__()
+#         self.config = config
+#         self.device = self.config.device
+#         self.tokenizer = tokenizer
+#         self.d_hidden =  self.config.d_enc_hidden
+#
+#         self.enc_emb = nn.Embedding(self.tokenizer.vocab_size, self.config.d_hidden)
+#         sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_enc_seq + 1, self.config.d_hidden), dtype=torch.float32)
+#         self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True)
+#
+#         self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config.n_layers)])
+#
+#     def forward(self, input_ids, attention_mask):
+#         # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
+#
+#         inputs = input_ids
+#
+#         positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
+#         pos_mask = inputs.eq(self.config.i_padding)
+#         positions.masked_fill_(pos_mask, 0)
+#
+#         outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
+#         outputs = outputs.to(dtype=torch.float32)
+#
+#         attn_mask = get_pad_mask(inputs, inputs, self.config.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
+#
+#         attn_probs = []
+#         for layer in self.layers:
+#             outputs, attn_prob = layer(outputs, attn_mask)
+#             # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
+#             attn_probs.append(attn_prob)
+#
+#         return outputs, attn_probs
 
 class DecoderLayer(nn.Module):
     def __init__(self, config):
@@ -227,18 +229,19 @@ class DecoderLayer(nn.Module):
         return ffn_outputs, dec_self_attn_prob, dec_enc_attn_prob
 
 class Decoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, tokenizer=None):
         super().__init__()
         self.config = config
         self.device = self.config.device
+        self.tokenizer = tokenizer
 
-        self.dec_emb = nn.Embedding(self.config.n_dec_vocab, self.config.d_hidden).to(self.device)
+        self.dec_emb = nn.Embedding(self.tokenizer.vocab_size, self.config.d_hidden).to(self.device)
         sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_dec_seq + 1, self.config.d_hidden), dtype=torch.float64).to(self.device)
         self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True).to(self.device)
 
         self.layers = nn.ModuleList([DecoderLayer(self.config) for _ in range(self.config.n_layers)])
 
-        self.out = nn.Linear(self.config.d_hidden, self.config.n_dec_vocab).to(self.device)
+        self.out = nn.Linear(self.config.d_hidden, self.tokenizer.vocab_size).to(self.device)
 
     def forward(self, dec_inputs, enc_inputs, enc_outputs):
         # dec_inputs: (batch_size, n_dec_seq), enc_inputs: (batch_size, n_enc_seq), enc_outputs: (batch_size, n_enc_seq, d_hidden)
@@ -266,54 +269,57 @@ class Decoder(nn.Module):
 
         return dec_outputs, dec_self_attn_probs, dec_enc_attn_probs
 
-class Predictor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.device = self.config.device
-        self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
-
-        self.layers = self.set_layers(self.d_hidden, self.config.d_pred_hidden, self.config.n_outputs, self.config.n_layers_predictor)
-        self.log_softmax = nn.LogSoftmax(dim=1)
-        self.relu = nn.ReLU()
-
-    def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
-        layers = [
-            nn.Sequential(
-                nn.Linear(d_input, d_hidden),
-                nn.ReLU()
-            )
-        ]
-        for _ in range(n_layers-1):
-            layers.append(
-                nn.Sequential(
-                    nn.Linear(d_hidden, d_hidden),
-                    nn.ReLU()
-                )
-            )
-        layers.append(nn.Sequential(nn.Linear(d_hidden, n_outputs)))
-        layers = nn.ModuleList(layers)
-
-        return layers
-
-    def forward(self, x):
-        # x (enc_outputs): (batch_size, n_enc_seq, d_latent)
-        batch_size = x.size(0)
-        #
-        # if self.config.take_last_h:
-        #     x = x[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-        # else:
-        #     attn_weighted = self.attn_weight(x) # attn_weighted: (batch_size, n_enc_seq, 1)
-        #     x = torch.bmm(attn_weighted.transpose(-1, 1), x).squeeze() # z: (batch_size, d_hidden)
-
-        for layer in self.layers:
-            x = layer(x)
-        out = x if batch_size > 1 else x.unsqueeze(0)
-        out = self.log_softmax(out)
-        # out = self.sigmoid(out)
-        # out = self.relu(out)
-
-        return out
+# class Predictor(nn.Module):
+#     def __init__(self, config, d_hidden=None):
+#         super().__init__()
+#         self.config = config
+#         self.device = self.config.device
+#         if d_hidden is not None:
+#             self.d_hidden = d_hidden
+#         else:
+#             self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+#
+#         self.layers = self.set_layers(self.d_hidden, self.config.d_pred_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+#         self.log_softmax = nn.LogSoftmax(dim=1)
+#         self.relu = nn.ReLU()
+#
+#     def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
+#         layers = [
+#             nn.Sequential(
+#                 nn.Linear(d_input, d_hidden),
+#                 nn.ReLU()
+#             )
+#         ]
+#         for _ in range(n_layers-1):
+#             layers.append(
+#                 nn.Sequential(
+#                     nn.Linear(d_hidden, d_hidden),
+#                     nn.ReLU()
+#                 )
+#             )
+#         layers.append(nn.Sequential(nn.Linear(d_hidden, n_outputs)))
+#         layers = nn.ModuleList(layers)
+#
+#         return layers
+#
+#     def forward(self, x):
+#         # x (enc_outputs): (batch_size, n_enc_seq, d_latent)
+#         batch_size = x.size(0)
+#         #
+#         # if self.config.take_last_h:
+#         #     x = x[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
+#         # else:
+#         #     attn_weighted = self.attn_weight(x) # attn_weighted: (batch_size, n_enc_seq, 1)
+#         #     x = torch.bmm(attn_weighted.transpose(-1, 1), x).squeeze() # z: (batch_size, d_hidden)
+#
+#         for layer in self.layers:
+#             x = layer(x)
+#         out = x if batch_size > 1 else x.unsqueeze(0)
+#         out = self.log_softmax(out)
+#         # out = self.sigmoid(out)
+#         # out = self.relu(out)
+#
+#         return out
 
 class Transformer(nn.Module):
     def __init__(self, config, tokenizers=None):
@@ -497,21 +503,94 @@ class Transformer(nn.Module):
         past_key_values = tuple((ca, ca) for ca in cross_attn)
         return past_key_values
 
-##########################################
-############# Class to class #############
-##########################################
+####################################################################################
+################################ Class to class ####################################
+####################################################################################
+
+class Predictor(nn.Module):
+    def __init__(self, config, d_hidden=None):
+        super().__init__()
+        self.config = config
+        self.device = self.config.device
+        if d_hidden is not None:
+            self.d_hidden = d_hidden
+        else:
+            self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+
+        self.layers = self.set_layers(self.d_hidden, self.config.d_pred_hidden, self.config.n_outputs, self.config.n_layers_predictor)
+        self.log_softmax = nn.LogSoftmax(dim=1)
+        self.relu = nn.ReLU()
+
+    def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
+        layers = [
+            nn.Sequential(
+                nn.Linear(d_input, d_hidden),
+                nn.ReLU()
+            )
+        ]
+        for _ in range(n_layers-1):
+            layers.append(
+                nn.Sequential(
+                    nn.Linear(d_hidden, d_hidden),
+                    nn.ReLU()
+                )
+            )
+        layers.append(nn.Sequential(nn.Linear(d_hidden, n_outputs)))
+        layers = nn.ModuleList(layers)
+
+        return layers
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        for layer in self.layers:
+            x = layer(x)
+        # out = x if batch_size > 1 else x.unsqueeze(0)
+        out = x
+        out = self.log_softmax(out)
+
+        return out
+
+class Encoder_Transformer(nn.Module):
+    def __init__(self, config, tokenizer=None):
+        super().__init__()
+        self.config = config
+        self.device = self.config.device
+        self.tokenizer = tokenizer
+        self.d_hidden =  self.config.d_enc_hidden
+
+        self.enc_emb = nn.Embedding(self.tokenizer.vocab_size, self.config.d_hidden)
+        sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_enc_seq_claim + 1, self.config.d_hidden), dtype=torch.float32)
+        self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True)
+
+        self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config.n_layers)])
+
+    def forward(self, input_ids, attention_mask):
+        # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
+
+        inputs = input_ids
+
+        positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
+        pos_mask = inputs.eq(self.config.i_padding)
+        positions.masked_fill_(pos_mask, 0)
+
+        outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
+        outputs = outputs.to(dtype=torch.float32)
+
+        attn_mask = get_pad_mask(inputs, inputs, self.config.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
+
+        attn_probs = []
+        for layer in self.layers:
+            outputs, attn_prob = layer(outputs, attn_mask)
+            # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
+            attn_probs.append(attn_prob)
+
+        return outputs, attn_probs
 
 class Encoder_SEQ(nn.Module):
     def __init__(self, config={}, tokenizer=None):
         super(Encoder_SEQ, self).__init__()
-        # for key, value in params.items():
-        #     setattr(self, key, value)
         self.config = config
         self.device = self.config.device
-        # if device is not None:
-        #     self.device = device
-        # else:
-        #     self.device = self.config.device
         self.tokenizer = tokenizer
         self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
 
@@ -541,17 +620,11 @@ class Encoder_SEQ(nn.Module):
 class Attention(nn.Module):
     def __init__(self, config={}):
         super(Attention, self).__init__()
-        # for key, value in params.items():
-        #     setattr(self, key, value)
         self.config = config
         self.device = self.config.device
-        # if device is not None:
-        #     self.device = device
-        # else:
-        #     self.device = self.config.device
-        self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+        self.d_hidden = (self.config.d_enc_hidden * self.config.n_directions + self.config.d_enc_hidden) + self.config.d_enc_hidden * self.config.n_directions
 
-        self.attn = nn.Linear(self.d_hidden + self.d_hidden, self.config.d_enc_hidden).to(self.device)
+        self.attn = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
         self.v = nn.Linear(self.config.d_enc_hidden, 1, bias=False).to(self.device)
 
     def forward(self, hidden, enc_outputs):
@@ -563,7 +636,6 @@ class Attention(nn.Module):
         hidden_last = hidden[-1] # (batch_size, hidden_dim * n_directions)
 
         hidden = hidden_last.unsqueeze(1).repeat(1, seq_len, 1) # (batch_size, seq_len, hidden_dim * n_directions)
-        # hidden = hidden.repeat(1, seq_len, 1)
 
         energy = torch.tanh(self.attn(torch.cat((hidden, enc_outputs), dim=2))) # (batch_size, seq_len, hidden_dim)
         attention = self.v(energy).squeeze(2) # (batch_size, seq_len)
@@ -573,21 +645,15 @@ class Attention(nn.Module):
 class AttnDecoder_SEQ(nn.Module):
     def __init__(self, config={}, tokenizer=None):
         super().__init__()
-        # for key, value in params.items():
-        #     setattr(self, key, value)
         self.config = config
         self.device = self.config.device
-        # if device is not None:
-        #     self.device = device
-        # else:
-        #     self.device = self.config.device
         self.tokenizer = tokenizer
         self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
 
         self.attention = Attention(config=self.config)
         self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.config.d_embedding).to(self.device)
-        self.gru = nn.GRU(self.d_hidden + self.config.d_embedding, self.d_hidden, self.config.n_layers, batch_first=True).to(self.device)
-        self.fc_out = nn.Linear(self.config.d_embedding + self.d_hidden + self.d_hidden, self.tokenizer.vocab_size).to(self.device)
+        self.gru = nn.GRU(self.d_hidden + self.config.d_embedding, self.d_hidden + self.config.d_enc_hidden, self.config.n_layers, batch_first=True).to(self.device)
+        self.fc_out = nn.Linear(self.config.d_embedding + self.d_hidden + self.d_hidden + self.config.d_enc_hidden, self.tokenizer.vocab_size).to(self.device)
         self.dropout = nn.Dropout(self.config.p_dropout).to(self.device)
 
     def forward(self, inputs, hidden, enc_outputs):
@@ -616,41 +682,56 @@ class AttnDecoder_SEQ(nn.Module):
 
         return prediction, hidden
 
-class SEQ2SEQ(nn.Module):
-    # def __init__(self, device, enc=None, dec=None, pred=None, vocab={}, max_len=99, u=0.5):
+class CLS2CLS(nn.Module):
     def __init__(self, config={}, tokenizers=None):
-        super(SEQ2SEQ, self).__init__()
+        super(CLS2CLS, self).__init__()
         self.config = config
         self.device = self.config.device
-        # if device is not None:
-        #     self.device = device
-        # else:
-        #     self.device = self.config.device
         self.tokenizers = tokenizers
-        self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+        # self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
 
-        self.encoder = Encoder_SEQ(config=self.config, tokenizer=config.tokenizers["enc"])
-        self.decoder = AttnDecoder_SEQ(config=self.config, tokenizer=config.tokenizers["dec"])
-        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
+        if self.config.pretrained_enc:
+            self.claim_encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
+            self.claim_encoder.config.output_attentions = True
+            self.claim_encoder.d_hidden = self.config.d_enc_hidden
+        else:
+            self.claim_encoder = Encoder_Transformer(self.config, tokenizer=self.tokenizers["claim_enc"])
+
+        self.class_encoder = Encoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_enc"])
+        self.encoders = nn.ModuleDict({"claim": self.claim_encoder, "class": self.class_encoder})
+
+        self.d_hidden = self.encoders["claim"].d_hidden + self.encoders["class"].d_hidden
+
+        # self.encoder = Encoder_SEQ(config=self.config, tokenizer=config.tokenizers["enc"])
+        self.decoder = AttnDecoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_dec"])
+        self.predictor = Predictor(self.config, self.d_hidden) if "pred" in self.config.model_type else None
         self.pooling_strategy = "max"
-        # self.mu = nn.Linear(self.d_hidden, self.config.d_latent, bias=False)
-        # self.logvar = nn.Linear(self.d_hidden, self.config.d_latent, bias=False)
         self.mu = nn.Linear(self.d_hidden, self.d_hidden, bias=False)
         self.logvar = nn.Linear(self.d_hidden, self.d_hidden, bias=False)
 
     def forward(self, enc_inputs, dec_inputs, teach_force_ratio=0.75):
-        # x: (batch_size, seq_len)
-        batch_size = enc_inputs.size(0)
+        if isinstance(enc_inputs, dict):
+            batch_size = enc_inputs["class"].size(0)
+        else:
+            batch_size = enc_inputs.size(0)
 
         enc_outputs, z, mu, logvar = self.encode(enc_inputs)
         pred_outputs = self.predict(z)
-        if enc_inputs.device != self.config.device:
-            curr_device = enc_inputs.device
+        if z.device != self.config.device:
+            curr_device = z.device
         else:
             curr_device = self.config.device
-        dec_outputs = self.decode(z, enc_outputs, dec_inputs, device=curr_device)
+        '''!! enc_outputs 도 claim class 합쳐보자 !!'''
+        dec_outputs = self.decode(z, enc_outputs["class"], dec_inputs, device=curr_device)
 
         return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs, "mu": mu, "logvar": logvar}
+
+    def freeze_(self, module_name, defreeze=False):
+        modules = {"decoder": self.decoder, "predictor": self.predictor, "claim_encoder": self.encoders["claim"], "class_encoder": self.encoders["class"]}
+        module = modules[module_name]
+        freezing = not defreeze
+        for p in module.parameters():
+            p.requires_grad = freezing
 
     def freeze(self, module=None):
         if module=="decoder":
@@ -658,6 +739,9 @@ class SEQ2SEQ(nn.Module):
                 p.requires_grad = False
         elif module=="predictor":
             for p in self.predictor.parameters():
+                p.requires_grad = False
+        elif module=="claim_encoder":
+            for p in self.encoders["claim"].parameters():
                 p.requires_grad = False
 
     def defreeze(self, module=None):
@@ -667,12 +751,28 @@ class SEQ2SEQ(nn.Module):
         elif module=="predictor":
             for p in self.predictor.parameters():
                 p.requires_grad = True
+        elif module=="claim_encoder":
+            for p in self.encoders["claim"].parameters():
+                p.requires_grad = True
 
     def encode(self, enc_inputs):
-        enc_outputs, last_hidden_state = self.encoder(enc_inputs)
+        # enc_outputs, last_hidden_state = self.encoder(enc_inputs)
+        enc_outputs = {}
+        if self.config.pretrained_enc:
+            enc_outputs_base = self.encoders["claim"](**enc_inputs["claim"])
+            enc_outputs["claim"] = enc_outputs_base.last_hidden_state
+        else:
+            enc_outputs["claim"], *_ = self.encoders["claim"](**enc_inputs["claim"]) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
 
-        pooled = self.pool(enc_outputs)
-        z, mu, logvar = self.calculate_latent(pooled)
+        enc_outputs["class"], *_ = self.encoders["class"](enc_inputs["class"])
+
+        # pooled = self.pool(enc_outputs)
+        pooled = {}
+        pooled["claim"] = self.pool(enc_outputs["claim"])
+        pooled["class"] = self.pool(enc_outputs["class"])
+        pooled_cat = torch.cat(list(pooled.values()), dim=1)
+        # z, mu, logvar = self.calculate_latent(pooled)
+        z, mu, logvar = self.calculate_latent(pooled_cat)
 
         return enc_outputs, z, mu, logvar
 
@@ -687,12 +787,12 @@ class SEQ2SEQ(nn.Module):
 
         next_hidden = z
 
-        next_input = torch.tensor(np.tile([self.tokenizers["enc"].vocab_w2i["<SOS>"]], batch_size), device=device) # (batch_size)
+        next_input = torch.tensor(np.tile([self.tokenizers["class_enc"].vocab_w2i["<SOS>"]], batch_size), device=device) # (batch_size)
 
-        dec_outputs = torch.zeros((batch_size, self.config.n_dec_seq, self.tokenizers["dec"].vocab_size), device=device) # (batch_size, vocab_size, seq_len)
-        dec_outputs += self.tokenizers["dec"].vocab_w2i["<PAD>"]
+        dec_outputs = torch.zeros((batch_size, self.config.n_dec_seq_class, self.tokenizers["class_dec"].vocab_size), device=device) # (batch_size, vocab_size, seq_len)
+        # dec_outputs += self.tokenizers["class_dec"].vocab_w2i["<PAD>"]
 
-        for t in range(1, self.config.n_dec_seq):
+        for t in range(1, self.config.n_dec_seq_class):
             output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, enc_outputs)
             # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim * n_directions), pred_token: (batch_size)
 
@@ -718,8 +818,13 @@ class SEQ2SEQ(nn.Module):
         if pred_token.size() == torch.Size([]):
             print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
 
-        if self.tokenizers["dec"].vocab_w2i["<EOS>"] in next_input.view(-1):
-            pred_token[next_input.view(-1)==self.tokenizers["dec"].vocab_w2i["<EOS>"]] = self.tokenizers["dec"].vocab_w2i["<PAD>"]
+        if self.tokenizers["class_dec"].eos_id in next_input.view(-1):
+            # print(next_input.view(-1))
+            pred_token[next_input.view(-1)==self.tokenizers["class_dec"].eos_id] = self.tokenizers["class_dec"].pad_id
+        if self.tokenizers["class_dec"].pad_id in next_input.view(-1):
+            # print(next_input.view(-1))
+            pred_token[next_input.view(-1)==self.tokenizers["class_dec"].pad_id] = self.tokenizers["class_dec"].pad_id
+
 
         return output, hidden, pred_token
 

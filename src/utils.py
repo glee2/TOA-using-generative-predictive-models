@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.2
-Description (primary changes): Class to class
+Version: 1.3
+Description (primary changes): Claim + class -> class
 '''
 
 # Set root directory
@@ -30,7 +30,14 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def to_device(x, device):
     if isinstance(x, dict):
-        return {k: v.to(device) for k,v in x.items()}
+        out = {}
+        for k,v in x.items():
+            if isinstance(v, dict):
+                out[k] = to_device(v, device)
+            else:
+                out[k] = v.to(device)
+        return out
+        # return {k: to_device(v, device) for k,v in x.items() if isinstance(v, dict) else k: v.to(device)}
     elif isinstance(x, torch.Tensor):
         return x.to(device)
 

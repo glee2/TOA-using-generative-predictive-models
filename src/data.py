@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.1
-Description (primary changes): Class to class
+Version: 1.2
+Description (primary changes): Claim + class -> class
 '''
 
 # Set root directory
@@ -55,12 +55,14 @@ class TechDataset(Dataset):
         for key, value in config.items():
             setattr(self, key, value)
 
-        self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file))
+        self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file), low_memory=False, nrows=self.data_nrows)
         self.target_classes = None
         self.data = self.preprocess()
         self.tokenizers = self.get_tokenizers()
         self.original_idx = np.array(self.data.index)
         self.X, self.Y, self.Y_digitized = self.make_io()
+        if isinstance(self.X, tuple):
+            self.X_claim, self.X_class = self.X
         self.n_outputs = len(np.unique(self.Y)) if self.pred_type == "classification" else 1
 
     def preprocess(self):
@@ -69,12 +71,7 @@ class TechDataset(Dataset):
         cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
         rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc', 'sub ipc', 'claims'])[['number','main ipc','sub ipc','claims']]
-        if self.target_ipc == "ALL":
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
-        else:
-            # main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc']) if self.target_ipc in x]
-            ## temporarily
-            main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+        main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
         assert len(main_ipcs) != 0, "target ipc is not observed"
 
         if self.data_type == "class" or self.data_type in ["class+claim", "claim+class"]:
@@ -92,7 +89,7 @@ class TechDataset(Dataset):
                 data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx for xx in x.split(";")])))
             data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
-            self.max_seq_len = seq_len if self.max_seq_len < seq_len else self.max_seq_len
+            self.max_seq_len_class = seq_len if self.max_seq_len_class < seq_len else self.max_seq_len_class
             if self.data_type in ["class+claim", "claim+class"]:
                 data["claims"] = rawdata_dropna.loc[data.index]["claims"]
         elif self.data_type == "claim":
@@ -108,21 +105,22 @@ class TechDataset(Dataset):
         bins_criterion = [data["TC"+str(self.n_TC)].quantile(0.9)]
         data["TC"+str(self.n_TC)+"_digitized"] = pd.Series(np.digitize(data["TC"+str(self.n_TC)].values, bins=bins_criterion, right=True))
 
-        # return data
-
         ## Get patent class
         patent_classes = data["main_ipc"].apply(lambda x: x[:self.class_level]).values
         label_encoder = LabelEncoder()
         label_encoder.fit(patent_classes)
         data["class"] = pd.Series(label_encoder.fit_transform(patent_classes))
-        # data["class"] = data["TC"+str(self.n_TC)+"_digitized"]
 
         if self.target_type == "class":
             self.target_classes = label_encoder.classes_
         elif self.target_type == "citation":
             self.target_classes = ["Least_valuable", "Most_valuable"]
 
-        data = data.set_index('number')
+        data.index = pd.Index(data["number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
+
+        sampled_index = data[data["TC"+str(self.n_TC)+"_digitized"]==0].sample(n=40000, random_state=10).index.union(data[data["TC"+str(self.n_TC)+"_digitized"]==1].index)
+
+        data = data.loc[sampled_index]
 
         return data
 
@@ -139,21 +137,21 @@ class TechDataset(Dataset):
                 ("<EOS>", tokenizer.token_to_id("<EOS>")),
             ],
         )
-        tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len)
-        if self.max_seq_len > 0:
-            tokenizer.enable_truncation(max_length=self.max_seq_len)
+        tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=self.max_seq_len_claim)
+        if self.max_seq_len_claim > 0:
+            tokenizer.enable_truncation(max_length=self.max_seq_len_claim)
         tokenizer.vocab_size = tokenizer.get_vocab_size()
-        print("Tokenizer is trained and saved")
-
         tokenizer.decoder = decoders.WordPiece()
+
+        print("Tokenizer is trained and saved")
 
         return tokenizer
 
     def get_tokenizers(self):
+        def custom_token_to_id(self): return self.convert_tokens_to_ids
+        def custom_decode_batch(self): return self.batch_decode
+        def custom_encode_batch(self): return self.encode
         if self.data_type == "claim":
-            def custom_token_to_id(self): return self.convert_tokens_to_ids
-            def custom_decode_batch(self): return self.batch_decode
-            def custom_encode_batch(self): return self.encode
             if self.pretrained_enc:
                 enc_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
                 enc_tokenizer.token_to_id = custom_token_to_id(enc_tokenizer)
@@ -172,11 +170,24 @@ class TechDataset(Dataset):
                     dec_tokenizer = enc_tokenizer
                 else:
                     dec_tokenizer = self.train_custom_tokenizer()
+            tokenizers = {"enc": enc_tokenizer, "dec": dec_tokenizer}
         elif self.data_type == "class":
-            enc_tokenizer = PatentClassTokenizer(self.data, max_len=self.max_seq_len)
+            enc_tokenizer = PatentClassTokenizer(self.data, max_len=self.max_seq_len_class)
             dec_tokenizer = enc_tokenizer
+            tokenizers = {"enc": enc_tokenizer, "dec": dec_tokenizer}
+        elif self.data_type in ["class+claim", "claim+class"]:
+            if self.pretrained_enc:
+                claim_enc_tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+                claim_enc_tokenizer.token_to_id = custom_token_to_id(claim_enc_tokenizer)
+                claim_enc_tokenizer.decode_batch = custom_decode_batch(claim_enc_tokenizer)
+                claim_enc_tokenizer.encode_batch = custom_encode_batch(claim_enc_tokenizer)
+            else:
+                claim_enc_tokenizer = self.train_custom_tokenizer()
+            claim_dec_tokenizer = claim_enc_tokenizer
 
-        tokenizers = {"enc": enc_tokenizer, "dec": dec_tokenizer}
+            class_enc_tokenizer = PatentClassTokenizer(self.data, max_len=self.max_seq_len_class)
+            class_dec_tokenizer = class_enc_tokenizer
+            tokenizers = {"claim_enc": claim_enc_tokenizer, "claim_dec": claim_dec_tokenizer, "class_enc": class_enc_tokenizer, "class_dec": class_dec_tokenizer}
 
         return tokenizers
 
@@ -198,13 +209,20 @@ class TechDataset(Dataset):
     def make_io(self, val_main=10, val_sub=1):
         if self.data_type == "class":
             X = self.data["ipcs"]
-            # X = self.tokenizers["enc"].encode_batch(self.data["ipcs"])
         elif self.data_type == "claim":
             claim_separator = "\n\n\n"
             if self.claim_level != -1:
                 X = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
             else:
                 X = self.data["claims"]
+        elif self.data_type in ["class+claim", "claim+class"]:
+            X_class = self.data["ipcs"]
+            claim_separator = "\n\n\n"
+            if self.claim_level != -1:
+                X_claim = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
+            else:
+                X_claim = self.data["claims"]
+            X = (X_claim, X_class)
 
         if self.target_type == "citation":
             Y_digitized = self.data["TC"+str(self.n_TC)+"_digitized"]
@@ -221,7 +239,7 @@ class TechDataset(Dataset):
 
     def tokenize(self, tokenizer, texts):
         if str(tokenizer.__class__).split("\'")[1].split(".")[0] == "transformers": # Tokenizer for pretrained language models
-            tokenized = tokenizer(texts, add_special_tokens=True, max_length=self.max_seq_len, padding="max_length", truncation=True)
+            tokenized = tokenizer(texts, add_special_tokens=True, max_length=self.max_seq_len_claim, padding="max_length", truncation=True)
             tokenized_dict = {"input_ids": torch.tensor(tokenized["input_ids"], dtype=torch.long),
                                  "attention_mask": torch.tensor(tokenized["attention_mask"], dtype=torch.long)}
             # tokenized_dict = {"input_ids": tokenized["input_ids"].to(dtype=torch.long),
@@ -236,22 +254,32 @@ class TechDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+        target_dtype = torch.long if self.pred_type=="classification" else torch.float32
+        target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
+
         if self.data_type == "class":
             input_classes = self.X[idx]
             output_claims = input_classes
             text_inputs_dict = torch.tensor(self.tokenizers["enc"].encode(input_classes), dtype=torch.long)
             text_outputs_dict = text_inputs_dict
+            out = {"text_inputs": text_inputs_dict, "text_outputs": text_outputs_dict, "targets": target_outputs}
         elif self.data_type == "claim":
             input_claims = self.extract_keywords([self.X[idx]])[0] if self.use_keywords else self.X[idx]
             output_claims = self.X[idx]
-
             text_inputs_dict = self.tokenize(self.tokenizers["enc"], input_claims)
             text_outputs_dict = self.tokenize(self.tokenizers["dec"], output_claims)
-
-        target_dtype = torch.long if self.pred_type=="classification" else torch.float32
-        target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
-
-        out = {"text_inputs": text_inputs_dict, "text_outputs": text_outputs_dict, "targets": target_outputs}
+            out = {"text_inputs": text_inputs_dict, "text_outputs": text_outputs_dict, "targets": target_outputs}
+        elif self.data_type in ["class+claim", "claim+class"]:
+            input_claims = self.extract_keywords([self.X_claim[idx]])[0] if self.use_keywords else self.X_claim[idx]
+            output_claims = self.X_claim[idx]
+            claim_inputs_dict = self.tokenize(self.tokenizers["claim_enc"], input_claims)
+            claim_outputs_dict = self.tokenize(self.tokenizers["claim_dec"], output_claims)
+            input_classes = self.X_class[idx]
+            output_classes = input_classes
+            class_inputs_dict = torch.tensor(self.tokenizers["class_enc"].encode(input_classes), dtype=torch.long)
+            class_outputs_dict = torch.tensor(self.tokenizers["class_dec"].encode(output_classes), dtype=torch.long)
+            # out = {"text_inputs": {"claim_inputs": claim_inputs_dict, "class_inputs": class_inputs_dict}, "text_outputs": {"claim_outputs": claim_outputs_dict, "class_outputs": class_outputs_dict}, "targets": target_outputs}
+            out = {"text_inputs": {"claim": claim_inputs_dict, "class": class_inputs_dict}, "text_outputs": class_outputs_dict, "targets": target_outputs}
 
         return out
 
@@ -264,6 +292,10 @@ class PatentClassTokenizer():
         self.eos_token = "<EOS>"
         self.unk_token = "<UNK>"
         self.set_vocabulary()
+        self.sos_id = self.vocab_w2i[self.sos_token]
+        self.pad_id = self.vocab_w2i[self.pad_token]
+        self.eos_id = self.vocab_w2i[self.eos_token]
+        self.unk_id = self.vocab_w2i[self.unk_token]
 
     def set_vocabulary(self):
         self.vocabulary = np.unique(np.concatenate(self.ipcs))
