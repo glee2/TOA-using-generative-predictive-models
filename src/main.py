@@ -88,7 +88,7 @@ parser.add_argument("--d_ff", type=int)
 parser.add_argument("--n_head", type=int)
 parser.add_argument("--d_head", type=int)
 parser.add_argument("--model_type", type=str)
-parser.add_argument("--bidirec", default=False, action="store_true")
+parser.add_argument("--bidirec", default=None, action="store_true")
 
 ## arguments passed only for main.py
 parser.add_argument("--do_save", default=False, action="store_true")
@@ -228,11 +228,14 @@ if __name__=="__main__":
         print("Make dataset...")
         if args.debug:
             configs.data.update({"data_nrows": 1000})
+            dataset_path += ".debug"
         tech_dataset = TechDataset(configs.data)
         if not args.debug:
+            rawdata_for_save = copy.deepcopy(tech_dataset.rawdata)
             with open(dataset_path, "wb") as f:
                 tech_dataset.rawdata = None
                 pickle.dump(tech_dataset, f)
+            tech_dataset.rawdata = rawdata_for_save
     tend = time.time()
     print(f"{np.round(tend-tstart,4)} sec elapsed for loading patents for class [{configs.data.target_ipc}]")
 
@@ -242,9 +245,7 @@ if __name__=="__main__":
                         "n_enc_seq_class": tech_dataset.max_seq_len_class,
                         "n_dec_seq_class": tech_dataset.max_seq_len_class,
                         "n_outputs": 1 if configs.data.pred_type=="regression" else tech_dataset.n_outputs,
-                        "i_padding": tech_dataset.tokenizers["class_enc"].token_to_id("<PAD>")})
-    if configs.model.pretrained_enc:
-        configs.model.update({"d_enc_hidden": 768})
+                        "i_padding": tech_dataset.tokenizers["class_enc"].pad_id})
 
     ''' PART 3: Training '''
     if configs.train.do_train:
@@ -307,8 +308,8 @@ if __name__=="__main__":
         test_dataset = Subset(tech_dataset, test_idx)
         whole_dataset = Subset(tech_dataset, whole_idx)
 
-        train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
-        val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True)
+        train_loader = DataLoader(train_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=configs.train.batch_size, shuffle=True, num_workers=0, drop_last=True, pin_memory=True)
 
         batch_size_for_test = 16 if len(test_dataset) > 16 else len(test_dataset)
         test_loader = DataLoader(test_dataset, batch_size=batch_size_for_test, shuffle=False, num_workers=0)
@@ -362,6 +363,8 @@ if __name__=="__main__":
 
         print("Training is done!\n")
 
+        ## Set device_ids that have space
+
         ''' PART 3-3: Training evaluation '''
         if args.eval_train_set:
             ## Evaluation on train dataset
@@ -404,7 +407,7 @@ if __name__=="__main__":
             if configs.data.use_keywords:
                 trues_recon_kw_test = np.concatenate([res["recon"]["kw"] for res in val_res_test.values()])
             else:
-                trues_recon_kw_test = None
+                trues_recon_kw_test = np.concatenate([res["recon"]["kw"] for res in val_res_test.values()])
             preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
             eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, recon_kw=trues_recon_kw_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizers["class_dec"])
             eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])

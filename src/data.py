@@ -79,14 +79,14 @@ class TechDataset(Dataset):
 
             assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
             if self.ipc_level == 1:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:3])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00")[:3])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00")[:3] for xx in x.split(";")])))
             elif self.ipc_level == 2:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00")[:4])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00")[:4] for xx in x.split(";")])))
             elif self.ipc_level == 3:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x)
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00"))
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00") for xx in x.split(";")])))
             data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
             self.max_seq_len_class = seq_len if self.max_seq_len_class < seq_len else self.max_seq_len_class
@@ -118,9 +118,9 @@ class TechDataset(Dataset):
 
         data.index = pd.Index(data["number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
 
-        sampled_index = data[data["TC"+str(self.n_TC)+"_digitized"]==0].sample(n=40000, random_state=10).index.union(data[data["TC"+str(self.n_TC)+"_digitized"]==1].index)
-
-        data = data.loc[sampled_index]
+        # sampled_index = data[data["TC"+str(self.n_TC)+"_digitized"]==0].sample(n=40000, random_state=10).index.union(data[data["TC"+str(self.n_TC)+"_digitized"]==1].index)
+        #
+        # data = data.loc[sampled_index]
 
         return data
 

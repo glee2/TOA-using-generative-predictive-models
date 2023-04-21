@@ -128,7 +128,6 @@ class DataParallelModel(DataParallel):
         modules = super(DataParallelModel, self).replicate(module, device_ids)
         return modules
 
-
 class DataParallelCriterion(DataParallel):
     """
     Calculate loss in multiple-GPUs, which balance the memory usage for

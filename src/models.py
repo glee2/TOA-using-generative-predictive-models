@@ -597,7 +597,7 @@ class Encoder_SEQ(nn.Module):
         self.gru = nn.GRU(self.config.d_embedding, self.config.d_enc_hidden, self.config.n_layers, batch_first=True, bidirectional=self.config.bidirec).to(self.device)
         self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.config.d_embedding, padding_idx=self.config.i_padding).to(self.device)
         self.dropout = nn.Dropout(self.config.p_dropout).to(self.device)
-        self.fc = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
+        # self.fc = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
 
     def forward(self, inputs):
         # inputs: (batch_size, seq_len)
@@ -617,12 +617,57 @@ class Encoder_SEQ(nn.Module):
     def initHidden(self, batch_size):
         return torch.zeros((self.config.n_layers * self.config.n_directions, batch_size, self.config.d_enc_hidden), device=self.config.device)
 
+class Decoder_SEQ(nn.Module):
+    def __init__(self, config={}, tokenizer=None, d_hidden=None):
+        super().__init__()
+        self.config = config
+        self.device = self.config.device
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        self.d_enc_hiddens = {"claim": self.config.d_enc_hidden_pretrained, "class": self.config.d_enc_hidden} if self.config.pretrained_enc else None
+        if self.config.pretrained_enc:
+            self.d_hidden = self.d_enc_hiddens["claim"] + self.d_enc_hiddens["class"]
+        else:
+            if d_hidden is not None:
+                self.d_hidden = d_hidden
+            else:
+                self.d_hidden = self.config.d_enc_hidden * self.config.n_directions
+
+        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.config.d_embedding)
+        self.dropout = nn.Dropout(self.config.p_dropout)
+        self.gru = nn.GRU(self.config.d_embedding, self.d_hidden, self.config.n_layers, batch_first=True)
+        self.fc_out = nn.Linear(self.d_hidden, self.tokenizer.vocab_size)
+        # self.log_softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, inputs, hidden=None):
+        inputs = inputs.unsqueeze(1)
+
+        if hidden is not None:
+            if len(hidden.size()) < 3: # last hidden state from encoder (when starting decoding)
+                hidden = hidden.unsqueeze(0).repeat(self.config.n_layers, 1, 1)
+        else:
+            hidden = self.initHidden(len(inputs))
+            if inputs.device != hidden.device: hidden = hidden.to(inputs.device)
+
+        embedded = self.dropout(self.embedding(inputs))
+        output, hidden = self.gru(embedded, hidden)
+        prediction = self.fc_out(output.squeeze(1))
+        # prediction = self.log_softmax(prediction)
+
+        return prediction, hidden
+
+    def initHidden(self, batch_size):
+        return torch.zeros((self.config.n_layers, batch_size, self.d_hidden))
+
 class Attention(nn.Module):
-    def __init__(self, config={}):
+    def __init__(self, config={}, d_enc_hiddens=None):
         super(Attention, self).__init__()
         self.config = config
         self.device = self.config.device
-        self.d_hidden = (self.config.d_enc_hidden * self.config.n_directions + self.config.d_enc_hidden) + self.config.d_enc_hidden * self.config.n_directions
+        if d_enc_hiddens is not None:
+            self.d_hidden = (d_enc_hiddens["claim"] + d_enc_hiddens["class"]) + self.config.d_dec_hidden * self.config.n_directions
+        else:
+            self.d_hidden = (self.config.d_enc_hidden * self.config.n_directions + self.config.d_enc_hidden) + self.config.d_enc_hidden * self.config.n_directions
 
         self.attn = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
         self.v = nn.Linear(self.config.d_enc_hidden, 1, bias=False).to(self.device)
@@ -647,14 +692,20 @@ class AttnDecoder_SEQ(nn.Module):
         super().__init__()
         self.config = config
         self.device = self.config.device
-        self.tokenizer = tokenizer
-        self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        self.d_enc_hiddens = {"claim": self.config.d_enc_hidden_pretrained, "class": self.config.d_enc_hidden} if self.config.pretrained_enc else None
+        if self.config.pretrained_enc:
+            self.d_hidden = self.d_enc_hiddens["claim"] + self.d_enc_hiddens["class"]
+        else:
+            self.d_hidden = self.config.d_enc_hidden
 
-        self.attention = Attention(config=self.config)
+        self.attention = Attention(config=self.config, d_enc_hiddens=self.d_enc_hiddens)
         self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.config.d_embedding).to(self.device)
-        self.gru = nn.GRU(self.d_hidden + self.config.d_embedding, self.d_hidden + self.config.d_enc_hidden, self.config.n_layers, batch_first=True).to(self.device)
-        self.fc_out = nn.Linear(self.config.d_embedding + self.d_hidden + self.d_hidden + self.config.d_enc_hidden, self.tokenizer.vocab_size).to(self.device)
+        self.gru = nn.GRU((self.config.d_enc_hidden * self.config.n_directions) + self.config.d_embedding, self.d_hidden, self.config.n_layers, batch_first=True).to(self.device)
+        self.fc_out = nn.Linear(self.config.d_embedding + (self.config.d_enc_hidden * self.config.n_directions) + self.d_hidden, self.tokenizer.vocab_size).to(self.device)
         self.dropout = nn.Dropout(self.config.p_dropout).to(self.device)
+        # self.log_softmax = nn.LogSoftmax(dim=1)
 
     def forward(self, inputs, hidden, enc_outputs):
         # inputs: (batch_size), hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
@@ -679,6 +730,7 @@ class AttnDecoder_SEQ(nn.Module):
         output = output.squeeze(1)
 
         prediction = self.fc_out(torch.cat((embedded, weighted, output), dim=1)) # (batch_size, vocab_size)
+        # prediction = self.log_softmax(prediction)
 
         return prediction, hidden
 
@@ -693,17 +745,19 @@ class CLS2CLS(nn.Module):
         if self.config.pretrained_enc:
             self.claim_encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
             self.claim_encoder.config.output_attentions = True
-            self.claim_encoder.d_hidden = self.config.d_enc_hidden
+            self.claim_encoder.d_hidden = 768
+            for p in self.claim_encoder.parameters():
+                p.requires_grad = False
         else:
             self.claim_encoder = Encoder_Transformer(self.config, tokenizer=self.tokenizers["claim_enc"])
 
         self.class_encoder = Encoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_enc"])
         self.encoders = nn.ModuleDict({"claim": self.claim_encoder, "class": self.class_encoder})
+        self.claim_encoder = self.class_encoder = None
 
         self.d_hidden = self.encoders["claim"].d_hidden + self.encoders["class"].d_hidden
 
-        # self.encoder = Encoder_SEQ(config=self.config, tokenizer=config.tokenizers["enc"])
-        self.decoder = AttnDecoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_dec"])
+        self.decoder = Decoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_dec"], d_hidden=self.d_hidden)
         self.predictor = Predictor(self.config, self.d_hidden) if "pred" in self.config.model_type else None
         self.pooling_strategy = "max"
         self.mu = nn.Linear(self.d_hidden, self.d_hidden, bias=False)
@@ -722,41 +776,17 @@ class CLS2CLS(nn.Module):
         else:
             curr_device = self.config.device
         '''!! enc_outputs 도 claim class 합쳐보자 !!'''
-        dec_outputs = self.decode(z, enc_outputs["class"], dec_inputs, device=curr_device)
+        dec_outputs = self.decode(z, enc_outputs["class"], dec_inputs, device=curr_device, teach_force_ratio=teach_force_ratio)
 
         return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs, "mu": mu, "logvar": logvar}
 
-    def freeze_(self, module_name, defreeze=False):
+    def freeze(self, module_name, defreeze=False):
         modules = {"decoder": self.decoder, "predictor": self.predictor, "claim_encoder": self.encoders["claim"], "class_encoder": self.encoders["class"]}
         module = modules[module_name]
-        freezing = not defreeze
         for p in module.parameters():
-            p.requires_grad = freezing
-
-    def freeze(self, module=None):
-        if module=="decoder":
-            for p in self.decoder.parameters():
-                p.requires_grad = False
-        elif module=="predictor":
-            for p in self.predictor.parameters():
-                p.requires_grad = False
-        elif module=="claim_encoder":
-            for p in self.encoders["claim"].parameters():
-                p.requires_grad = False
-
-    def defreeze(self, module=None):
-        if module=="decoder":
-            for p in self.decoder.parameters():
-                p.requires_grad = True
-        elif module=="predictor":
-            for p in self.predictor.parameters():
-                p.requires_grad = True
-        elif module=="claim_encoder":
-            for p in self.encoders["claim"].parameters():
-                p.requires_grad = True
+            p.requires_grad = defreeze
 
     def encode(self, enc_inputs):
-        # enc_outputs, last_hidden_state = self.encoder(enc_inputs)
         enc_outputs = {}
         if self.config.pretrained_enc:
             enc_outputs_base = self.encoders["claim"](**enc_inputs["claim"])
@@ -771,7 +801,6 @@ class CLS2CLS(nn.Module):
         pooled["claim"] = self.pool(enc_outputs["claim"])
         pooled["class"] = self.pool(enc_outputs["class"])
         pooled_cat = torch.cat(list(pooled.values()), dim=1)
-        # z, mu, logvar = self.calculate_latent(pooled)
         z, mu, logvar = self.calculate_latent(pooled_cat)
 
         return enc_outputs, z, mu, logvar
@@ -809,7 +838,8 @@ class CLS2CLS(nn.Module):
         return dec_outputs
 
     def pred_next(self, next_input, next_hidden, enc_outputs):
-        output, hidden = self.decoder(next_input, next_hidden, enc_outputs)
+        # output, hidden = self.decoder(next_input, next_hidden, enc_outputs)
+        output, hidden = self.decoder(next_input, next_hidden)
         # output: (batch_size, vocab_size), hidden: (n_layers, batch_size, hidden_dim * n_directions)
 
         pred_token = output.argmax(1) # (batch_size)
@@ -818,13 +848,12 @@ class CLS2CLS(nn.Module):
         if pred_token.size() == torch.Size([]):
             print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
 
-        if self.tokenizers["class_dec"].eos_id in next_input.view(-1):
-            # print(next_input.view(-1))
-            pred_token[next_input.view(-1)==self.tokenizers["class_dec"].eos_id] = self.tokenizers["class_dec"].pad_id
-        if self.tokenizers["class_dec"].pad_id in next_input.view(-1):
-            # print(next_input.view(-1))
-            pred_token[next_input.view(-1)==self.tokenizers["class_dec"].pad_id] = self.tokenizers["class_dec"].pad_id
-
+        # if self.tokenizers["class_dec"].eos_id in next_input.view(-1):
+        #     # print(next_input.view(-1))
+        #     pred_token[next_input.view(-1)==self.tokenizers["class_dec"].eos_id] = self.tokenizers["class_dec"].pad_id
+        # if self.tokenizers["class_dec"].pad_id in next_input.view(-1):
+        #     # print(next_input.view(-1))
+        #     pred_token[next_input.view(-1)==self.tokenizers["class_dec"].pad_id] = self.tokenizers["class_dec"].pad_id
 
         return output, hidden, pred_token
 
@@ -854,3 +883,26 @@ class CLS2CLS(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps * std + mu
+
+
+    # def freeze(self, module=None):
+    #     if module=="decoder":
+    #         for p in self.decoder.parameters():
+    #             p.requires_grad = False
+    #     elif module=="predictor":
+    #         for p in self.predictor.parameters():
+    #             p.requires_grad = False
+    #     elif module=="claim_encoder":
+    #         for p in self.encoders["claim"].parameters():
+    #             p.requires_grad = False
+    #
+    # def defreeze(self, module=None):
+    #     if module=="decoder":
+    #         for p in self.decoder.parameters():
+    #             p.requires_grad = True
+    #     elif module=="predictor":
+    #         for p in self.predictor.parameters():
+    #             p.requires_grad = True
+    #     elif module=="claim_encoder":
+    #         for p in self.encoders["claim"].parameters():
+    #             p.requires_grad = True
