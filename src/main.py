@@ -179,7 +179,6 @@ if __name__=="__main__":
         d_embedding = configs.model.d_embedding = None
         d_enc_hidden = configs.model.d_enc_hidden = None
         d_pred_hidden = configs.model.d_pred_hidden = None
-        d_latent = 64
         learning_rate = configs.train.learning_rate = None
         batch_size = configs.train.batch_size = None
         config_name = "HPARAM_TUNING"
@@ -190,9 +189,6 @@ if __name__=="__main__":
         d_enc_hidden = configs.model.d_enc_hidden
         d_pred_hidden = configs.model.d_pred_hidden
         d_latent = configs.model.d_enc_hidden * configs.model.n_directions
-        d_latent = 64
-
-        configs.model.update({"d_latent": d_latent})
 
         key_components = {"data": ["target_ipc", "vocab_size"], "model": ["n_layers", "d_enc_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
         config_name = ""

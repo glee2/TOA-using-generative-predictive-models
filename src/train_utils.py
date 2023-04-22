@@ -36,7 +36,7 @@ from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
-from models import Transformer, CLS2CLS
+from models import Transformer, CLS2CLS, VCLS2CLS
 from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -94,6 +94,12 @@ def epoch_time(start, end):
     elapsed_secs = int(elapsed_time - (elapsed_mins * 60))
     return elapsed_mins, elapsed_secs
 
+def kl_anneal_function(step, func_type="logistic", k=0.0025, x0=2500):
+    if func_type == 'logistic':
+        return float(1/(1+np.exp(-k*(step-x0))))
+    elif func_type == 'linear':
+        return min(1, step/x0)
+
 def build_model(model_params={}, trial=None, tokenizers=None):
     device = model_params['device']
     device_ids = model_params['device_ids']
@@ -108,7 +114,8 @@ def build_model(model_params={}, trial=None, tokenizers=None):
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_enc_seq'], model_params['d_hidden'] * model_params['n_enc_seq'])
 
     # model = Transformer(model_params, tokenizers=tokenizers).to(device)
-    model = CLS2CLS(model_params, tokenizers=tokenizers).to(device)
+    model = VCLS2CLS(model_params, tokenizers=tokenizers).to(device)
+    # model = CLS2CLS(model_params, tokenizers=tokenizers).to(device)
     if re.search("^2.", torch.__version__) is not None:
         print("INFO: PyTorch 2.* imported, compile model")
         model = torch.compile(model)
@@ -127,7 +134,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'], reduction="sum")
-    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss(weight=class_weights)
+    loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss(weight=class_weights, reduction="sum")
     loss_kld = KLDLoss()
     loss_recon = DataParallelCriterion(loss_recon, device_ids=model_params['device_ids'])
     loss_y = DataParallelCriterion(loss_y, device_ids=model_params['device_ids'])
@@ -218,9 +225,12 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         model.train()
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0, "kld": 0}
 
+        # Temporary
+        preds_y_container = []
+
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=train_params['learning_rate'])
 
-        for i, batch_data in tqdm(enumerate(data_loader)):
+        for step, batch_data in tqdm(enumerate(data_loader)):
             torch.cuda.empty_cache()
             # batch_data = to_device(batch_data, device)
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
@@ -230,7 +240,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             if ON_IPYTHON:
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                     with record_function("model_feedforward"):
-                        outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
+                        outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=train_params["teach_force_ratio"]) # omit <eos> from target sequence
                         outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                         outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                         outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
@@ -239,7 +249,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                         # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
                         dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
             else:
-                outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=1.0) # omit <eos> from target sequence
+                outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=train_params["teach_force_ratio"]) # omit <eos> from target sequence
                 outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => outputs_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
                 outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                 outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
@@ -251,22 +261,23 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Forward pass")
 
             if "dec" in model_params["model_type"]:
-                # preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
                 preds_recon = dict_outputs["recon"]
                 trues_recon = batch_data["text_outputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
                 preds_mu = dict_outputs["mu"]
                 preds_logvar = torch.cat([t.to(device) for t in dict_outputs["logvar"]])
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
+                # Temporary
+                preds_y_container.append(preds_y.cpu().detach().numpy().argmax(-1))
                 trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
             if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
-                loss_kld = loss_f["KLD"](preds_mu, preds_logvar)
+                loss_kld = kl_anneal_function(step) * loss_f["KLD"](preds_mu, preds_logvar)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
                     if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                        loss = loss_recon + loss_kld + loss_y
+                        loss = loss_y
                     else:
                         loss = loss_recon + loss_kld
                 else:
@@ -285,7 +296,12 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 dict_epoch_losses["recon"] += loss_recon.item()
                 dict_epoch_losses["kld"] += loss_kld.item()
 
+            dict_epoch_losses["total"] += loss.item()
+
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Loss calculation")
+
+            ## averaging (by batch_size)
+            loss /= data_loader.batch_size
 
             if train_params['use_accelerator']:
                 train_params['accelerator'].backward(loss)
@@ -300,13 +316,16 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Weight update")
 
-            dict_epoch_losses["total"] += loss.item()
-
         if ON_IPYTHON:
             print(prof.key_averages().table(sort_by='cuda_time_total', row_limit=10))
             print(prof.key_averages().table(sort_by='cpu_time_total', row_limit=10))
 
-        dict_epoch_losses = {key: (value/len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
+        dict_epoch_losses = {key: value / (data_loader.batch_size * len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
+
+        # Temporary
+        preds_y_container = np.concatenate(preds_y_container)
+        preds_y_counts = np.unique(preds_y_container, return_counts=True)[1]
+        print(f"Pred 0: {preds_y_counts[0]}, Pred 1: {preds_y_counts[1]}")
 
         return dict_epoch_losses
 
@@ -315,12 +334,12 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0, "kld": 0}
 
         with torch.no_grad():
-            for i, batch_data in tqdm(enumerate(data_loader)):
+            for step, batch_data in tqdm(enumerate(data_loader)):
                 # batch_data = to_device(batch_data, device)
                 if ON_IPYTHON:
                     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                         with record_function("model_feedforward"):
-                            outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
+                            outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=0.) # omit <eos> from target sequence
                             outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                             outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                             outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
@@ -329,7 +348,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                             # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
                             dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
                 else:
-                    outputs = model(batch_data["text_inputs"], batch_data["text_outputs"]) # omit <eos> from target sequence
+                    outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=0.) # omit <eos> from target sequence
                     outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                     outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                     outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
@@ -339,7 +358,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
 
                 if "dec" in model_params["model_type"]:
-                    # preds_recon = [output.permute(0,2,1) for output in dict_outputs["recon"]] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => pred_trg: (batch_size, n_dec_vocab, n_dec_seq-1)
                     preds_recon = dict_outputs["recon"]
                     trues_recon = batch_data["text_outputs"][:,1:] if model_params["model_name"] == "class2class" else batch_data["text_outputs"]["input_ids"][:,1:]
                     preds_mu = dict_outputs["mu"]
@@ -350,11 +368,11 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
                 if model_params["model_type"] == "enc-pred-dec":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
-                    loss_kld = loss_f["KLD"](preds_mu, preds_logvar)
+                    loss_kld = kl_anneal_function(step) * loss_f["KLD"](preds_mu, preds_logvar)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
                         if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                            loss = loss_recon + loss_kld + loss_y
+                            loss = loss_y
                         else:
                             loss = loss_recon + loss_kld
                     else:
@@ -370,14 +388,18 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 elif model_params["model_type"] == "enc-recon":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
                     loss_kld = loss_f["KLD"](preds_mu, preds_logvar)
-                    loss = loss_recon + loss_kld
                     loss_y = torch.tensor(0)
+                    loss = loss_recon # + loss_kld
                     dict_epoch_losses["recon"] += loss_recon.item()
                     dict_epoch_losses["kld"] += loss_kld.item()
 
-                dict_epoch_losses["total"] += loss_recon.item() + loss_kld.item() + loss_y.item()
+                # dict_epoch_losses["total"] += loss_recon.item() + loss_kld.item() + loss_y.item()
+                dict_epoch_losses["total"] += loss.item()
 
-        dict_epoch_losses = {key: (value/len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
+                ## averaging (by batch_size)
+                loss /= data_loader.batch_size
+
+        dict_epoch_losses = {key: value / (data_loader.batch_size * len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
 
         return dict_epoch_losses
 
@@ -434,6 +456,7 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
             trues_y.append(batch_data["targets"].cpu().detach().numpy())
 
             enc_outputs, z, mu, logvar = model.encode(batch_data["text_inputs"])
+            # enc_outputs, z = model.encode(batch_data["text_inputs"])
 
             if "pred" in model_params["model_type"]:
                 preds_y_batch = model.predict(z)
@@ -526,7 +549,7 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         trues_claims = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
         # preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
         preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
-        BLEU_scores = pd.Series([sentence_bleu([t],p) for t,p in zip(trues_class.values, preds_class.values)])
+        BLEU_scores = pd.Series([sentence_bleu([t],p, weights=(1.0,)) for t,p in zip(trues_class.values, preds_class.values)])
         if recon_kw is not None:
             trues_claims_kw = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
             eval_res = pd.concat([trues_class, trues_claims_kw, preds_class, BLEU_scores], axis=1)
