@@ -171,7 +171,6 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Before training")
 
     if model_params["pretrained_enc"]: model.module.freeze(module_name="claim_encoder")
-    # model.module.freeze(module_name="predictor")
 
     for ep in range(max_epochs):
         epoch_start = time.time()
@@ -179,15 +178,11 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
         if model_params["model_type"]=="enc-pred-dec" and train_params["alternate_train"]:
             if ep > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                model.module.freeze(module_name="decoder")
+                # model.module.freeze(module_name="decoder")
                 model.module.freeze(module_name="predictor", defreeze=True)
-                # # model.module.freeze(module="decoder")
-                # model.module.defreeze(module="predictor")
             else:
                 model.module.freeze(module_name="decoder", defreeze=True)
                 model.module.freeze(module_name="predictor")
-                # model.module.freeze(module="predictor")
-                # model.module.defreeze(module="decoder")
 
         train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
         val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
@@ -268,7 +263,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
                 # Temporary
-                preds_y_container.append(preds_y.cpu().detach().numpy().argmax(-1))
+                preds_y_container.append(np.concatenate([ppp.cpu().detach().numpy().argmax(-1) for ppp in preds_y]))
                 trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
 
             if model_params["model_type"] == "enc-pred-dec":
@@ -277,7 +272,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
                     if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                        loss = loss_y
+                        loss = loss_y + loss_recon + loss_kld
                     else:
                         loss = loss_recon + loss_kld
                 else:
@@ -324,7 +319,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
         # Temporary
         preds_y_container = np.concatenate(preds_y_container)
-        preds_y_counts = np.unique(preds_y_container, return_counts=True)[1]
+        preds_y_counts = (len(preds_y_container[preds_y_container==0]), len(preds_y_container[preds_y_container==1]))
         print(f"Pred 0: {preds_y_counts[0]}, Pred 1: {preds_y_counts[1]}")
 
         return dict_epoch_losses
@@ -372,7 +367,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
                         if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
-                            loss = loss_y
+                            loss = loss_y + loss_recon + loss_kld
                         else:
                             loss = loss_recon + loss_kld
                     else:
@@ -548,15 +543,15 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         trues_class = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
         trues_claims = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
         # preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
-        preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
+        preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x[x.index(tokenizer.sos_token)+1:])
         BLEU_scores = pd.Series([sentence_bleu([t],p, weights=(1.0,)) for t,p in zip(trues_class.values, preds_class.values)])
         if recon_kw is not None:
             trues_claims_kw = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
-            eval_res = pd.concat([trues_class, trues_claims_kw, preds_class, BLEU_scores], axis=1)
+            eval_res = pd.concat([trues_claims_kw, trues_class, preds_class, BLEU_scores], axis=1)
             if configs.data.use_keywords:
-                eval_res.columns = ['Origin IPCs', 'Origin claims (keywords)', 'Generated IPCs', "BLEU Score"]
+                eval_res.columns = ['Origin claims (keywords)', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
             else:
-                eval_res.columns = ['Origin IPCs', 'Origin claims', 'Generated IPCs', "BLEU Score"]
+                eval_res.columns = ['Origin claims', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
             eval_res.loc[len(eval_res)] = ["", "", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
         else:
             eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)

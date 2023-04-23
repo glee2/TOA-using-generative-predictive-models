@@ -76,17 +76,19 @@ class TechDataset(Dataset):
 
         if self.data_type == "class" or self.data_type in ["class+claim", "claim+class"]:
             data = rawdata_dropna[["number"]].copy(deep=True)
-
-            assert self.ipc_level in [1,2,3], f"Not implemented for an IPC level {self.ipc_level}"
-            if self.ipc_level == 1:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00")[:3])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00")[:3] for xx in x.split(";")])))
-            elif self.ipc_level == 2:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00")[:4])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00")[:4] for xx in x.split(";")])))
-            elif self.ipc_level == 3:
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: (x.split("/")[0]+"/00"))
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([(xx.split("/")[0]+"/00") for xx in x.split(";")])))
+            assert self.ipc_level in [1,2,3,4], f"Not implemented for an IPC level {self.ipc_level}"
+            if self.ipc_level == 1: # Section-Subsection (e.g., "A61")
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:3])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
+            elif self.ipc_level == 2: # Section-Subsection-Class (e.g., "A61K")
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
+            elif self.ipc_level == 3: # Section-Subsection-Class-Main group (e.g., "A61K03")
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x.split("/")[0][:4]+"0"+x.split("/")[0][4:] if len(x.split("/")[0][4:])<2 else x.split("/")[0])
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx.split("/")[0][:4]+"0"+xx.split("/")[0][4:] if len(xx.split("/")[0][4:])<2 else xx.split("/")[0] for xx in x.split(";")])))
+            elif self.ipc_level == 4: # Section-Subsection-Class-Sub group (e.g., "A61K03/45")
+                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4]+"0"+x[4:] if len(x[4:].split("/")[0])<2 else x)
+                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4]+"0"+xx[4:] if len(xx[4:].split("/")[0])<2 else xx for xx in x.split(";")])))
             data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
             self.max_seq_len_class = seq_len if self.max_seq_len_class < seq_len else self.max_seq_len_class

@@ -379,8 +379,8 @@ if __name__=="__main__":
                 if configs.data.use_keywords:
                     trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
                 else:
-                    trues_recon_kw_train = None
-                eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizers["dec"])
+                    trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
+                eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizers["class_dec"])
                 eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[whole_idx].index)+[""])
         else:
             eval_recon_train = eval_y_train = confmat_y_train = None
@@ -449,7 +449,6 @@ if __name__=="__main__":
         del best_states
         del converted_states
         torch.cuda.empty_cache()
-
         print("Model successfully loaded")
 
         instant_dataset = Subset(tech_dataset, np.random.choice(np.arange(len(tech_dataset)), 1000))
