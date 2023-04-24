@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.3
-Description (primary changes): Claim + class -> class
+Version: 1.31
+Description (primary changes): Early stopping for each criterion
 '''
 
 # Set root directory
@@ -57,27 +57,27 @@ class EarlyStopping:
         self.delta = delta
         self.path = path
 
-    def __call__(self, val_loss, model):
+    def __call__(self, model, val_loss):
         score = -val_loss
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(model, val_loss)
         elif score < self.best_score + self.delta:
             self.counter += 1
             print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
                 # Load latest saved model
-                self.load_model(model)
+                model = self.load_model(model)
         else:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
+            self.save_checkpoint(model, val_loss)
             self.counter = 0
 
         return model
 
-    def save_checkpoint(self, val_loss, model):
+    def save_checkpoint(self, model, val_loss):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...\n')
         torch.save(model.state_dict(), self.path)
@@ -87,6 +87,50 @@ class EarlyStopping:
         saved_model = copy.copy(model)
         saved_model.load_state_dict(torch.load(self.path))
         return saved_model
+
+class EarlyStopping_multi(EarlyStopping):
+    def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt', criteria=None):
+        super().__init__()
+        self.best_scores = None
+        if delta is not None:
+            self.delta = delta
+        else:
+            self.delta = 0.01
+        self.deltas = None
+        if criteria is not None:
+            self.criteria = criteria
+        else:
+            self.criteria = ["total", "recon", "y"]
+        self.val_losses_min = {criterion: np.Inf for criterion in self.criteria}
+
+    def __call__(self, model, val_losses={}):
+        scores = {k: -val_losses[k] for k in self.criteria}
+
+        if self.best_scores is None:
+            self.best_scores = scores
+            self.deltas = {k: self.best_scores[k]*self.delta for k in self.criteria}
+            self.save_checkpoint(model, val_losses)
+        elif any([scores[k] < self.best_scores[k] + self.deltas[k] for k in self.criteria]):
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+                # Load latest saved model
+                model = self.load_model(model)
+        else:
+            self.best_scores = scores
+            self.deltas = {k: self.best_scores[k]*self.delta for k in self.criteria}
+            self.save_checkpoint(model, val_losses)
+            self.counter = 0
+
+        return model
+
+    def save_checkpoint(self, model, val_losses):
+        if self.verbose:
+            for criterion in self.criteria:
+                print(f'Validation loss[{criterion}] decreased ({self.val_losses_min[criterion]:.6f} --> {val_losses[criterion]:.6f})')
+        torch.save(model.state_dict(), self.path)
+        self.val_losses_min = val_losses
 
 def epoch_time(start, end):
     elapsed_time = end - start
@@ -166,7 +210,8 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Training
     if train_params['use_early_stopping']:
-        early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['config_name']+".ckpt"))
+        # early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['config_name']+".ckpt"))
+        early_stopping = EarlyStopping_multi(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"))
 
     print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Before training")
 
@@ -202,7 +247,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         writer.add_scalar("Loss/val[y]", val_loss["y"], ep)
 
         if train_params['use_early_stopping']:
-            model = early_stopping(val_loss["total"], model)
+            model = early_stopping(model, val_losses=val_loss)
             if early_stopping.early_stop:
                 print("Early stopped\n")
                 break

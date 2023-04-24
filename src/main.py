@@ -109,6 +109,7 @@ if __name__=="__main__":
     result_dir = os.path.join(root_dir, "results")
     config_dir = os.path.join(root_dir, "configs")
 
+    ## parse configuration file
     args = parser.parse_args()
     if args.config_file is not None:
         config_file = args.config_file
@@ -118,17 +119,19 @@ if __name__=="__main__":
     configs = DotDict().load(config_file)
     org_config_keys = {key: list(configs[key].keys()) for key in configs.keys()}
 
+    # parse command line arguments
     instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
     instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
     for key, value in configs.items():
         value.update(instant_configs_for_update[key])
+    #
+    # regex_ipc = re.compile('[A-Z](?![\\D])')
+    # if regex_ipc.match(configs.data.target_ipc) is None:
+    #     configs.data.update({"target_ipc": "ALL"})
+    # elif len(configs.data.target_ipc) > 5:
+    #     configs.data.update({"target_ipc": configs.data.target_ipc[:4]})
 
-    regex_ipc = re.compile('[A-Z](?![\\D])')
-    if regex_ipc.match(configs.data.target_ipc) is None:
-        configs.data.update({"target_ipc": "ALL"})
-    elif len(configs.data.target_ipc) > 5:
-        configs.data.update({"target_ipc": configs.data.target_ipc[:4]})
-
+    ## assign loss weights
     if configs.model.model_type == "enc-pred-dec":
         configs.train.loss_weights["recon"] = configs.train.loss_weights["recon"] / sum(configs.train.loss_weights.values())
         configs.train.loss_weights["y"] = 1 - configs.train.loss_weights["recon"]
@@ -137,6 +140,7 @@ if __name__=="__main__":
     elif configs.model.model_type == "enc-dec":
         configs.train.loss_weights = {"recon": 1, "y": 0}
 
+    ## assign devices
     if configs.train.use_accelerator:
         accelerator = Accelerator()
         device_ids = list(range(torch.cuda.device_count()))
@@ -154,13 +158,20 @@ if __name__=="__main__":
             device = torch.device('cpu')
             device_ids = []
 
+    ## extract configurations for dataset
+    config_period = "["+"-".join([str(year) for year in configs.data.target_period])+"]"
+    config_ipcs = str(configs.data.target_ipc).replace("\'","").replace(" ","")
+    config_keywords = str(configs.data.target_keywords).replace("\'","").replace(" ","")
+
+    ## update configurations
     configs.data.update({"root_dir": root_dir,
                             "data_dir": data_dir,
                             "model_dir": model_dir,
                             "result_dir": result_dir,
                             "pretrained_enc": configs.model.pretrained_enc,
                             "pretrained_dec": configs.model.pretrained_dec,
-                            "data_nrows": None})
+                            "data_nrows": None,
+                            "data_file": "collection_" + "".join([config_keywords, config_ipcs, config_period]) + ".csv"})
     configs.train.update({"device": device,
                             "device_ids": device_ids,
                             "root_dir": root_dir,
@@ -188,26 +199,36 @@ if __name__=="__main__":
         d_embedding = configs.model.d_embedding
         d_enc_hidden = configs.model.d_enc_hidden
         d_pred_hidden = configs.model.d_pred_hidden
-        d_latent = configs.model.d_enc_hidden * configs.model.n_directions
+        d_latent = configs.model.d_latent
 
-        key_components = {"data": ["target_ipc", "vocab_size"], "model": ["n_layers", "d_enc_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
-        config_name = ""
-        for key in key_components.keys():
+        ## set filename for model
+        key_components = {"data": ["ipc_level", "max_seq_len_class", "max_seq_len_claim", "vocab_size"], "model": ["n_layers", "d_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs"]}
+        model_config_name = "".join([config_keywords, config_ipcs, config_period]) + "data"
+        for key in ["model", "train"]:
             for component in key_components[key]:
-                config_name += "["+str(configs[key][component])+component+"]"
-        final_model_path = os.path.join(model_dir, f"[Final_model]{config_name}.ckpt")
+                model_config_name += f"[{str(configs[key][component])}]{component}"
+        final_model_path = os.path.join(model_dir, f"[MODEL]{model_config_name}.ckpt")
 
-    configs.train.update({"config_name": config_name,
-                            "final_model_path": final_model_path})
+    configs.train.update({"model_config_name": model_config_name, "final_model_path": final_model_path})
 
     ''' PART 2: Dataset setting '''
     tstart = time.time()
-    org_config_keys_temp = copy.copy(org_config_keys["data"])
-    org_config_keys_temp.pop(org_config_keys_temp.index("data_file"))
-    org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_claim"))
-    org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_class"))
-    dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys_temp])
-    dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
+    # org_config_keys_temp = copy.copy(org_config_keys["data"])
+    # org_config_keys_temp.pop(org_config_keys_temp.index("data_file"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_claim"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_class"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("target_type"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("target_keywords"))
+    # org_config_keys_temp.pop(org_config_keys_temp.index("pred_target"))
+    # dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys_temp])
+
+    # key_components = ["ipc_level", "max_seq_len_class", "max_seq_len_claim", "vocab_size"]
+    dataset_config_name = "".join([config_keywords, config_ipcs, config_period]) + "data"
+    for component in key_components["data"]:
+        dataset_config_name += f"[{str(configs.data[component])}]{component}"
+    dataset_path = os.path.join(data_dir, "pickled_dataset", "[DATASET]"+dataset_config_name+".pickle")
+
+    # dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
     if os.path.exists(dataset_path) and args.do_save is False:
         print("Load pickled dataset...")
         with open(dataset_path, "rb") as f:
@@ -285,11 +306,11 @@ if __name__=="__main__":
                 json.dump(configs_to_save, f, indent=4)
 
         configs_to_save = {configkey: {key: configs[configkey][key] for key in org_config_keys[configkey]} for configkey in org_config_keys}
-        fname_config_to_save = "[CONFIGS]"+current_datetime+".json"
+        fname_configs_to_save = "[CONFIGS]"+current_datetime+".json"
 
         def instant_save(model):
             torch.save(model.state_dict(), final_model_path)
-            with open(os.path.join(config_dir, "USED_configs", fname_config_to_save), "w") as f:
+            with open(os.path.join(config_dir, "USED_configs", fname_configs_to_save), "w") as f:
                 json.dump(configs_to_save, f, indent=4)
 
         ''' PART 3-2: Dataset construction and model training '''
@@ -334,7 +355,9 @@ if __name__=="__main__":
                 converted_states[k] = v
             final_model.load_state_dict(converted_states)
         else:
+            weight_alpha = 0.7 # hyperparameter to adjust class weights
             class_weights = torch.tensor(np.unique(tech_dataset.Y[whole_idx], return_counts=True)[1][::-1].copy()).to(device)
+            class_weights[class_weights.argmax()] = class_weights[class_weights.argmax()] * weight_alpha
             class_weights = class_weights / class_weights.sum()
             # print(np.sum(list(final_model.module.parameters())[0].cpu().detach().numpy()))
             if args.continue_train:
@@ -426,9 +449,9 @@ if __name__=="__main__":
 
         torch.cuda.empty_cache()
 
-        with open(os.path.join(config_dir, "USED_configs", fname_config_to_save), "w") as f:
+        with open(os.path.join(config_dir, "USED_configs", fname_configs_to_save), "w") as f:
             json.dump(configs_to_save, f, indent=4)
-        with open(os.path.join(configs.data.result_dir, "USED_configs", fname_config_to_save), "w") as f:
+        with open(os.path.join(configs.data.result_dir, "USED_configs", fname_configs_to_save), "w") as f:
             json.dump(configs_to_save, f, indent=4)
 
     else:
@@ -471,3 +494,23 @@ if __name__=="__main__":
         with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
             eval_y.to_excel(writer, sheet_name=configs.data.pred_type+" results")
             eval_recon.to_excel(writer, sheet_name="Generation results")
+
+def save_successful():
+    successful_path = os.path.join('/home2/glee/dissertation/1_tech_gen_impact/class2class/successful_backups/', current_datetime)
+    os.mkdir(successful_path)
+    successful_final_model_path = os.path.join(successful_path, f"[Final_model]{config_name}.ckpt")
+    torch.save(final_model.state_dict(), successful_final_model_path)
+    with pd.ExcelWriter(os.path.join(successful_path, fname_results_to_save)) as writer:
+        if "pred" in configs.model.model_type:
+            eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
+            if configs.data.pred_type == "classification":
+                confmat_y_res.to_excel(writer, sheet_name="Confusion_matrix")
+        if "dec" in configs.model.model_type:
+            if args.eval_train_set:
+                eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+            eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+    with pd.ExcelWriter(os.path.join(successful_path, fname_datasets_to_save)) as writer:
+        tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+        tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
+    with open(os.path.join(successful_path, fname_configs_to_save), "w") as f:
+        json.dump(configs_to_save, f, indent=4)

@@ -70,37 +70,37 @@ class TechDataset(Dataset):
         latest_year = datetime.datetime.now().year-1
         cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
-        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main ipc', 'sub ipc', 'claims'])[['number','main ipc','sub ipc','claims']]
-        main_ipcs = [x for x in pd.unique(rawdata_dropna['main ipc'])]
+        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_ipc', 'sub_ipc', 'claims'])[['number','main_ipc','sub_ipc','claims']]
+        main_ipcs = [x for x in pd.unique(rawdata_dropna['main_ipc'])]
         assert len(main_ipcs) != 0, "target ipc is not observed"
 
         if self.data_type == "class" or self.data_type in ["class+claim", "claim+class"]:
             data = rawdata_dropna[["number"]].copy(deep=True)
             assert self.ipc_level in [1,2,3,4], f"Not implemented for an IPC level {self.ipc_level}"
             if self.ipc_level == 1: # Section-Subsection (e.g., "A61")
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:3])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:3])
+                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
             elif self.ipc_level == 2: # Section-Subsection-Class (e.g., "A61K")
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:4])
+                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
             elif self.ipc_level == 3: # Section-Subsection-Class-Main group (e.g., "A61K03")
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x.split("/")[0][:4]+"0"+x.split("/")[0][4:] if len(x.split("/")[0][4:])<2 else x.split("/")[0])
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx.split("/")[0][:4]+"0"+xx.split("/")[0][4:] if len(xx.split("/")[0][4:])<2 else xx.split("/")[0] for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x.split("/")[0][:4]+"0"+x.split("/")[0][4:] if len(x.split("/")[0][4:])<2 else x.split("/")[0])
+                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx.split("/")[0][:4]+"0"+xx.split("/")[0][4:] if len(xx.split("/")[0][4:])<2 else xx.split("/")[0] for xx in x.split(";")])))
             elif self.ipc_level == 4: # Section-Subsection-Class-Sub group (e.g., "A61K03/45")
-                data['main_ipc'] = rawdata_dropna['main ipc'].apply(lambda x: x[:4]+"0"+x[4:] if len(x[4:].split("/")[0])<2 else x)
-                data['sub_ipc'] = rawdata_dropna['sub ipc'].apply(lambda x: list(np.unique([xx[:4]+"0"+xx[4:] if len(xx[4:].split("/")[0])<2 else xx for xx in x.split(";")])))
+                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:4]+"0"+x[4:] if len(x[4:].split("/")[0])<2 else x)
+                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:4]+"0"+xx[4:] if len(xx[4:].split("/")[0])<2 else xx for xx in x.split(";")])))
             data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
             seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
             self.max_seq_len_class = seq_len if self.max_seq_len_class < seq_len else self.max_seq_len_class
             if self.data_type in ["class+claim", "claim+class"]:
                 data["claims"] = rawdata_dropna.loc[data.index]["claims"]
         elif self.data_type == "claim":
-            data = rawdata_dropna.loc[rawdata_dropna['main ipc'].isin(main_ipcs)]
+            data = rawdata_dropna.loc[rawdata_dropna['main_ipc'].isin(main_ipcs)]
 
         rawdata_tc = self.rawdata.loc[data.index]
 
         ## Get number of forward citations within 5 years (TC5)
-        data["TC"+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["year"] if x["year"]<latest_year else latest_year, x["year"]+1+self.n_TC if x["year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
+        data["TC"+str(self.n_TC)] = rawdata_tc.apply(lambda x: x[np.arange(x["granted_year"] if x["granted_year"]<latest_year else latest_year, x["granted_year"]+1+self.n_TC if x["granted_year"]+1+self.n_TC<latest_year+1 else latest_year).astype(str)].sum(), axis=1)
         data = data.reset_index(drop=True)
 
         ## Get digitized number of forward citations within 5 years (TC5_digitized)
@@ -113,9 +113,9 @@ class TechDataset(Dataset):
         label_encoder.fit(patent_classes)
         data["class"] = pd.Series(label_encoder.fit_transform(patent_classes))
 
-        if self.target_type == "class":
+        if self.pred_target == "class":
             self.target_classes = label_encoder.classes_
-        elif self.target_type == "citation":
+        elif self.pred_target == "citation":
             self.target_classes = ["Least_valuable", "Most_valuable"]
 
         data.index = pd.Index(data["number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
@@ -226,13 +226,13 @@ class TechDataset(Dataset):
                 X_claim = self.data["claims"]
             X = (X_claim, X_class)
 
-        if self.target_type == "citation":
+        if self.pred_target == "citation":
             Y_digitized = self.data["TC"+str(self.n_TC)+"_digitized"]
             if self.pred_type == "regression":
                 Y = self.data["TC"+str(self.n_TC)]
             elif self.pred_type == "classification":
                 Y = self.data["TC"+str(self.n_TC)+"_digitized"]
-        elif self.target_type == "class":
+        elif self.pred_target == "class":
             Y = Y_digitized = self.data["class"]
         else:
             Y = None
