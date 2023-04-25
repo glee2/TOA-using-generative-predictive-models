@@ -104,7 +104,8 @@ if __name__=="__main__":
     current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M")
 
     ''' PART 1: Configuration '''
-    data_dir = os.path.join(master_dir, "data")
+    project_data_dir = os.path.join(master_dir, "data")
+    data_dir = os.path.join("/home2/glee/patent_data/data/")
     model_dir = os.path.join(root_dir, "models")
     result_dir = os.path.join(root_dir, "results")
     config_dir = os.path.join(root_dir, "configs")
@@ -124,12 +125,6 @@ if __name__=="__main__":
     instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
     for key, value in configs.items():
         value.update(instant_configs_for_update[key])
-    #
-    # regex_ipc = re.compile('[A-Z](?![\\D])')
-    # if regex_ipc.match(configs.data.target_ipc) is None:
-    #     configs.data.update({"target_ipc": "ALL"})
-    # elif len(configs.data.target_ipc) > 5:
-    #     configs.data.update({"target_ipc": configs.data.target_ipc[:4]})
 
     ## assign loss weights
     if configs.model.model_type == "enc-pred-dec":
@@ -213,22 +208,11 @@ if __name__=="__main__":
 
     ''' PART 2: Dataset setting '''
     tstart = time.time()
-    # org_config_keys_temp = copy.copy(org_config_keys["data"])
-    # org_config_keys_temp.pop(org_config_keys_temp.index("data_file"))
-    # org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_claim"))
-    # org_config_keys_temp.pop(org_config_keys_temp.index("max_seq_len_class"))
-    # org_config_keys_temp.pop(org_config_keys_temp.index("target_type"))
-    # org_config_keys_temp.pop(org_config_keys_temp.index("target_keywords"))
-    # org_config_keys_temp.pop(org_config_keys_temp.index("pred_target"))
-    # dataset_config_name = "-".join([str(key)+"="+str(value) for (key,value) in configs.data.items() if key in org_config_keys_temp])
-
-    # key_components = ["ipc_level", "max_seq_len_class", "max_seq_len_claim", "vocab_size"]
     dataset_config_name = "".join([config_keywords, config_ipcs, config_period]) + "data"
     for component in key_components["data"]:
         dataset_config_name += f"[{str(configs.data[component])}]{component}"
-    dataset_path = os.path.join(data_dir, "pickled_dataset", "[DATASET]"+dataset_config_name+".pickle")
+    dataset_path = os.path.join(project_data_dir, "pickled_dataset", "[DATASET]"+dataset_config_name+".pickle")
 
-    # dataset_path = os.path.join(data_dir, "pickled_dataset", "[tech_dataset]"+dataset_config_name+".pickle")
     if os.path.exists(dataset_path) and args.do_save is False:
         print("Load pickled dataset...")
         with open(dataset_path, "rb") as f:
@@ -382,8 +366,6 @@ if __name__=="__main__":
 
         print("Training is done!\n")
 
-        ## Set device_ids that have space
-
         ''' PART 3-3: Training evaluation '''
         if args.eval_train_set:
             ## Evaluation on train dataset
@@ -497,8 +479,9 @@ if __name__=="__main__":
 
 def save_successful():
     successful_path = os.path.join('/home2/glee/dissertation/1_tech_gen_impact/class2class/successful_backups/', current_datetime)
-    os.mkdir(successful_path)
-    successful_final_model_path = os.path.join(successful_path, f"[Final_model]{config_name}.ckpt")
+    if not os.path.exists(successful_path):
+        os.mkdir(successful_path)
+    successful_final_model_path = os.path.join(successful_path, f"[Final_model]{model_config_name}.ckpt")
     torch.save(final_model.state_dict(), successful_final_model_path)
     with pd.ExcelWriter(os.path.join(successful_path, fname_results_to_save)) as writer:
         if "pred" in configs.model.model_type:

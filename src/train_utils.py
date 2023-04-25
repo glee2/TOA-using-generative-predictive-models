@@ -584,20 +584,17 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         assert tokenizer is not None, "Tokenizer is needed to convert ids to tokens"
 
         ## Temporary -> TODO: make dictionary of claim and class
-        # trues_class = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
-        trues_class = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
         trues_claims = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
-        # preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: ",".join(x).split(tokenizer.eos_token)[0][:-1])
+        trues_class = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
         preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x[x.index(tokenizer.sos_token)+1:])
         BLEU_scores = pd.Series([sentence_bleu([t],p, weights=(1.0,)) for t,p in zip(trues_class.values, preds_class.values)])
         if recon_kw is not None:
             trues_claims_kw = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
             eval_res = pd.concat([trues_claims_kw, trues_class, preds_class, BLEU_scores], axis=1)
-            if configs.data.use_keywords:
-                eval_res.columns = ['Origin claims (keywords)', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
-            else:
-                eval_res.columns = ['Origin claims', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
-            eval_res.loc[len(eval_res)] = ["", "", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
+            eval_res.columns = ['Origin claims (keywords)', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
+            Jaccard_similarities = eval_res.apply(lambda x: len(set(x["Origin IPCs"]).intersection(set(x["Generated IPCs"]))) / len(set(x["Origin IPCs"]).union(set(x["Generated IPCs"]))), axis=1)
+            eval_res.loc[:,"Jaccard Similarity"] = Jaccard_similarities
+            eval_res.loc[len(eval_res)] = ["", "", "Average", np.round(np.mean(BLEU_scores.values),4), np.round(np.mean(Jaccard_similarities.values),4)]
         else:
             eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)
             eval_res.columns = ['Origin IPCs', 'Origin claims', 'Generated IPCs', "BLEU Score"]
