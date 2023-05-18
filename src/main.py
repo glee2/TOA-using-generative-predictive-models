@@ -98,10 +98,11 @@ parser.add_argument("--debug", default=False, action="store_true")
 parser.add_argument("--light", default=False, action="store_true")
 parser.add_argument("--eval_train_set", default=False, action="store_true")
 parser.add_argument("--config_file", default=None, type=str)
+parser.add_argument("--analysis_date", default=None, type=str)
 
 if __name__=="__main__":
     mp.set_start_method("spawn")
-    current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H:%M")
+    current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
 
     ''' PART 1: Configuration '''
     project_data_dir = os.path.join(master_dir, "data")
@@ -224,11 +225,15 @@ if __name__=="__main__":
             for tk in tech_dataset.tokenizers.values():
                 if "vocab_size" not in dir(tk):
                     tk.vocab_size = tk.get_vocab_size()
+            tech_dataset.use_keywords = configs.data.use_keywords
+            ## load saved rawdata
+            if tech_dataset.rawdata is None:
+                tech_dataset.rawdata = pd.read_csv(os.path.join(data_dir, configs.data.data_file), low_memory=False)
         print("Pickled dataset loaded")
     else:
         print("Make dataset...")
         if args.debug:
-            configs.data.update({"data_nrows": 1000})
+            configs.data.update({"data_nrows": 5000})
             dataset_path += ".debug"
         tech_dataset = TechDataset(configs.data)
         if not args.debug:
@@ -339,7 +344,7 @@ if __name__=="__main__":
                 converted_states[k] = v
             final_model.load_state_dict(converted_states)
         else:
-            weight_alpha = 0.7 # hyperparameter to adjust class weights
+            weight_alpha = 0.67 # hyperparameter to adjust class weights
             class_weights = torch.tensor(np.unique(tech_dataset.Y[whole_idx], return_counts=True)[1][::-1].copy()).to(device)
             class_weights[class_weights.argmax()] = class_weights[class_weights.argmax()] * weight_alpha
             class_weights = class_weights / class_weights.sum()
@@ -365,6 +370,11 @@ if __name__=="__main__":
         torch.cuda.empty_cache()
 
         print("Training is done!\n")
+
+        fname_datasets_to_save = "[DATASET]"+current_datetime+".xlsx"
+        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_datasets_to_save)) as writer:
+            tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+            tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")        
 
         ''' PART 3-3: Training evaluation '''
         if args.eval_train_set:
@@ -414,7 +424,6 @@ if __name__=="__main__":
             eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])
 
         fname_results_to_save = "[RESULTS]"+current_datetime+".xlsx"
-        fname_datasets_to_save = "[DATASET]"+current_datetime+".xlsx"
 
         with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
             if "pred" in configs.model.model_type:
@@ -425,9 +434,6 @@ if __name__=="__main__":
                 if args.eval_train_set:
                     eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
                 eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
-        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_datasets_to_save)) as writer:
-            tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
-            tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
 
         torch.cuda.empty_cache()
 
@@ -456,26 +462,112 @@ if __name__=="__main__":
         torch.cuda.empty_cache()
         print("Model successfully loaded")
 
-        instant_dataset = Subset(tech_dataset, np.random.choice(np.arange(len(tech_dataset)), 1000))
-        data_loader = DataLoader(instant_dataset, batch_size=128)
+        if args.analysis_date is not None:
+            analysis_date = args.analysis_date
 
-        print("Validate model on test dataset")
-        val_res = validate_model_mp(final_model, instant_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
-        trues_recon = np.concatenate([res["recon"]["true"] for res in val_res.values()])
-        preds_recon = np.concatenate([res["recon"]["pred"] for res in val_res.values()])
-        trues_y = np.concatenate([res["y"]["true"] for res in val_res.values()])
-        preds_y = np.concatenate([res["y"]["pred"] for res in val_res.values()])
+            used_train_data = pd.read_excel(os.path.join(result_dir, "[DATASET]"+analysis_date+".xlsx"), sheet_name="TRAIN_dataset")
+            train_idx = tech_dataset.data.index.get_indexer(pd.Index(used_train_data["number"]))
+            train_dataset = Subset(tech_dataset, train_idx)
 
-        eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative', tokenizer=tech_dataset.tokenizers["class_dec"])
-        eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
-        if configs.data.pred_type == "classification":
-            eval_y, confmat_y = eval_y
+            used_test_data = pd.read_excel(os.path.join(result_dir, "[DATASET]"+analysis_date+".xlsx"), sheet_name="TEST_dataset")
+            test_idx = tech_dataset.data.index.get_indexer(pd.Index(used_test_data["number"]))
+            test_dataset = Subset(tech_dataset, test_idx)
 
-        fname_results_to_save = "[LOADED_RESULTS]"+current_datetime+".xlsx"
+            configs_to_save = {configkey: {key: configs[configkey][key] for key in org_config_keys[configkey]} for configkey in org_config_keys}
+            fname_configs_to_save = "[CONFIGS]"+current_datetime+".json"
 
-        with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
-            eval_y.to_excel(writer, sheet_name=configs.data.pred_type+" results")
-            eval_recon.to_excel(writer, sheet_name="Generation results")
+            if args.eval_train_set:
+                ## Evaluation on train dataset
+                print("Validate model on train dataset")
+                val_res_train = validate_model_mp(final_model, train_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
+                if "pred" in configs.model.model_type:
+                    trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
+                    preds_y_train = np.concatenate([res["y"]["pred"] for res in val_res_train.values()])
+                    eval_y_train = perf_eval("TRAIN_SET", trues_y_train, preds_y_train, configs=configs, pred_type=configs.data.pred_type, custom_weight=None)
+                    if configs.data.pred_type == "classification":
+                        eval_y_train, confmat_y_train = eval_y_train
+
+                if "dec" in configs.model.model_type:
+                    trues_recon_train = np.concatenate([res["recon"]["true"] for res in val_res_train.values()])
+                    preds_recon_train = np.concatenate([res["recon"]["pred"] for res in val_res_train.values()])
+                    if configs.data.use_keywords:
+                        trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
+                    else:
+                        trues_recon_kw_train = np.concatenate([res["recon"]["kw"] for res in val_res_train.values()])
+                    eval_recon_train = perf_eval("TRAIN_SET", trues_recon_train, preds_recon_train, recon_kw=trues_recon_kw_train, configs=configs, pred_type='generative', tokenizer=final_model.module.tokenizers["class_dec"])
+                    eval_recon_train.index = pd.Index(list(tech_dataset.data.iloc[train_idx].index)+[""])
+            else:
+                eval_recon_train = eval_y_train = confmat_y_train = None
+
+            ## Evaluation on test dataset
+            print("Validate model on test dataset")
+            val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train)
+            if "pred" in configs.model.model_type:
+                trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
+                preds_y_test = np.concatenate([res["y"]["pred"] for res in val_res_test.values()])
+                eval_y_test = perf_eval("TEST_SET", trues_y_test, preds_y_test, configs=configs, pred_type=configs.data.pred_type, custom_weight=None)
+                if configs.data.pred_type == "classification":
+                    eval_y_test, confmat_y_test = eval_y_test
+                eval_y_res = pd.concat([eval_y_train, eval_y_test], axis=0)
+                if configs.data.pred_type == "classification":
+                    confmat_y_res = pd.concat([confmat_y_train, confmat_y_test], axis=0)
+
+            if "dec" in configs.model.model_type:
+                trues_recon_test = np.concatenate([res["recon"]["true"] for res in val_res_test.values()])
+                if configs.data.use_keywords:
+                    trues_recon_kw_test = np.concatenate([res["recon"]["kw"] for res in val_res_test.values()])
+                else:
+                    trues_recon_kw_test = np.concatenate([res["recon"]["kw"] for res in val_res_test.values()])
+                preds_recon_test = np.concatenate([res["recon"]["pred"] for res in val_res_test.values()])
+                eval_recon_test = perf_eval("TEST_SET", trues_recon_test, preds_recon_test, recon_kw=trues_recon_kw_test, configs=configs,  pred_type='generative', tokenizer=final_model.module.tokenizers["class_dec"])
+                eval_recon_test.index = pd.Index(list(tech_dataset.data.iloc[test_idx].index)+[""])
+
+            fname_results_to_save = "[RESULTS]"+current_datetime+".xlsx"
+            fname_datasets_to_save = "[DATASET]"+current_datetime+".xlsx"
+
+            with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
+                if "pred" in configs.model.model_type:
+                    eval_y_res.to_excel(writer, sheet_name=f"{configs.data.pred_type}_metrics")
+                    if configs.data.pred_type == "classification":
+                        confmat_y_res.to_excel(writer, sheet_name="Confusion_matrix")
+                if "dec" in configs.model.model_type:
+                    if args.eval_train_set:
+                        eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
+                    eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
+
+            with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_datasets_to_save)) as writer:
+                tech_dataset.data.iloc[train_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+                tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
+
+            torch.cuda.empty_cache()
+
+            with open(os.path.join(config_dir, "USED_configs", fname_configs_to_save), "w") as f:
+                json.dump(configs_to_save, f, indent=4)
+
+            with open(os.path.join(configs.data.result_dir, "USED_configs", fname_configs_to_save), "w") as f:
+                json.dump(configs_to_save, f, indent=4)
+
+        else:
+            instant_dataset = Subset(tech_dataset, np.random.choice(np.arange(len(tech_dataset)), 1000))
+            data_loader = DataLoader(instant_dataset, batch_size=128)
+
+            print("Validate model on test dataset")
+            val_res = validate_model_mp(final_model, instant_dataset, mp=mp, batch_size=64, model_params=configs.model, train_params=configs.train)
+            trues_recon = np.concatenate([res["recon"]["true"] for res in val_res.values()])
+            preds_recon = np.concatenate([res["recon"]["pred"] for res in val_res.values()])
+            trues_y = np.concatenate([res["y"]["true"] for res in val_res.values()])
+            preds_y = np.concatenate([res["y"]["pred"] for res in val_res.values()])
+
+            eval_recon = perf_eval("LOADED_MODEL", trues_recon, preds_recon, configs=configs, pred_type='generative', tokenizer=tech_dataset.tokenizers["class_dec"])
+            eval_y = perf_eval("LOADED_MODEL", trues_y, preds_y, configs=configs, pred_type=configs.data.pred_type)
+            if configs.data.pred_type == "classification":
+                eval_y, confmat_y = eval_y
+
+            fname_results_to_save = "[LOADED_RESULTS]"+current_datetime+".xlsx"
+
+            with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_results_to_save)) as writer:
+                eval_y.to_excel(writer, sheet_name=configs.data.pred_type+" results")
+                eval_recon.to_excel(writer, sheet_name="Generation results")
 
 def save_successful():
     successful_path = os.path.join('/home2/glee/dissertation/1_tech_gen_impact/class2class/successful_backups/', current_datetime)
@@ -493,7 +585,10 @@ def save_successful():
                 eval_recon_train.to_excel(writer, sheet_name="Generative_TRAIN")
             eval_recon_test.to_excel(writer, sheet_name="Generative_TEST")
     with pd.ExcelWriter(os.path.join(successful_path, fname_datasets_to_save)) as writer:
-        tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+        if args.do_eval and args.analysis_date is not None:
+            tech_dataset.data.iloc[train_idx].to_excel(writer, sheet_name="TRAIN_dataset")
+        else:
+            tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
         tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
     with open(os.path.join(successful_path, fname_configs_to_save), "w") as f:
         json.dump(configs_to_save, f, indent=4)

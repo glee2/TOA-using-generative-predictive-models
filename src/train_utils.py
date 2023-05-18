@@ -89,46 +89,58 @@ class EarlyStopping:
         return saved_model
 
 class EarlyStopping_multi(EarlyStopping):
-    def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt', criteria=None):
+    def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt', criteria=None, alternate_train_threshold=None):
         super().__init__()
         self.best_scores = None
+        self.alternate_train_threshold = alternate_train_threshold
         if delta is not None:
             self.delta = delta
         else:
             self.delta = 0.01
         self.deltas = None
+        self.loss_types = ["total", "recon", "kld", "y"]
         if criteria is not None:
             self.criteria = criteria
         else:
-            self.criteria = ["total", "recon", "y"]
+            self.criteria = ["recon", "y"]
         self.val_losses_min = {criterion: np.Inf for criterion in self.criteria}
 
-    def __call__(self, model, val_losses={}):
-        scores = {k: -val_losses[k] for k in self.criteria}
+    def __call__(self, model, val_losses={}, ep=None):
+        scores = {k: -val_losses[k] for k in self.loss_types}
+
+        if self.alternate_train_threshold is not None and ep > self.alternate_train_threshold:
+            print("alternate_train_threshold entered")
+            self.change_criteria(["recon", "y"])
+        else:
+            self.change_criteria(["recon"])
 
         if self.best_scores is None:
             self.best_scores = scores
-            self.deltas = {k: self.best_scores[k]*self.delta for k in self.criteria}
+            self.deltas = {k: self.best_scores[k]*self.delta for k in self.loss_types}
             self.save_checkpoint(model, val_losses)
         elif any([scores[k] < self.best_scores[k] + self.deltas[k] for k in self.criteria]):
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}\n')
             if self.counter >= self.patience:
                 self.early_stop = True
                 # Load latest saved model
                 model = self.load_model(model)
         else:
             self.best_scores = scores
-            self.deltas = {k: self.best_scores[k]*self.delta for k in self.criteria}
+            self.deltas = {k: self.best_scores[k]*self.delta for k in self.loss_types}
             self.save_checkpoint(model, val_losses)
             self.counter = 0
 
         return model
 
+    def change_criteria(self, criteria):
+        self.criteria = criteria
+
     def save_checkpoint(self, model, val_losses):
         if self.verbose:
             for criterion in self.criteria:
                 print(f'Validation loss[{criterion}] decreased ({self.val_losses_min[criterion]:.6f} --> {val_losses[criterion]:.6f})')
+            print("\n")
         torch.save(model.state_dict(), self.path)
         self.val_losses_min = val_losses
 
@@ -176,6 +188,9 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     if train_params['use_accelerator']:
         accelerator = train_params['accelerator']
 
+    if train_params["alternate_train"]:
+        alternate_train_threshold = train_params["max_epochs"] - max(40, int(train_params["max_epochs"] * 0.6))
+
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'], reduction="sum")
     loss_y = torch.nn.MSELoss() if model_params['n_outputs']==1 else torch.nn.NLLLoss(weight=class_weights, reduction="sum")
@@ -210,8 +225,10 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     ## Training
     if train_params['use_early_stopping']:
-        # early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['config_name']+".ckpt"))
-        early_stopping = EarlyStopping_multi(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"))
+        if model_params["model_type"]!="enc-pred-dec":
+            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"))
+        else:
+            early_stopping = EarlyStopping_multi(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"), alternate_train_threshold=alternate_train_threshold)
 
     print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Before training")
 
@@ -222,19 +239,18 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         print(f"Epoch {ep+1}\n"+str("-"*25))
 
         if model_params["model_type"]=="enc-pred-dec" and train_params["alternate_train"]:
-            if ep > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
+            if ep > alternate_train_threshold:
                 # model.module.freeze(module_name="decoder")
                 model.module.freeze(module_name="predictor", defreeze=True)
             else:
                 model.module.freeze(module_name="decoder", defreeze=True)
                 model.module.freeze(module_name="predictor")
 
-        train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params)
-        val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params)
+        train_loss = run_epoch(train_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='train', train_params=train_params, model_params=model_params, alternate_train_threshold=alternate_train_threshold)
+        val_loss = run_epoch(val_loader, model, epoch=ep, loss_f=loss_f, optimizer=optimizer, mode='eval', train_params=train_params, model_params=model_params, alternate_train_threshold=alternate_train_threshold)
         epoch_end = time.time()
         epoch_mins, epoch_secs = epoch_time(epoch_start, epoch_end)
         print(f'Epoch: {ep + 1:02} | Time: {epoch_mins}m {epoch_secs}s')
-        # print(f"Avg train loss: {train_loss['total']:>5f} (recon loss: {train_loss['recon']:>5f}, y loss: {train_loss['y']:>5f})\nAvg val loss: {val_loss['total']:>5f} (recon loss: {val_loss['recon']:>5f}, y loss: {val_loss['y']:>5f})\n")
         print(f"Avg train loss: {train_loss['total']:>5f} (recon loss: {train_loss['recon']:>5f}, kld loss: {train_loss['kld']:>5f}, y loss: {train_loss['y']:>5f})\nAvg val loss: {val_loss['total']:>5f} (recon loss: {val_loss['recon']:>5f}, kld loss: {val_loss['kld']:>5f}, y loss: {val_loss['y']:>5f})\n")
 
         writer.add_scalar("Loss/train[total]", train_loss["total"], ep)
@@ -247,7 +263,10 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         writer.add_scalar("Loss/val[y]", val_loss["y"], ep)
 
         if train_params['use_early_stopping']:
-            model = early_stopping(model, val_losses=val_loss)
+            if model_params["model_type"]!="enc-pred-dec":
+                model = early_stopping(model, val_loss=val_loss["total"])
+            else:
+                model = early_stopping(model, val_losses=val_loss, ep=ep)
             if early_stopping.early_stop:
                 print("Early stopped\n")
                 break
@@ -258,7 +277,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     writer.close()
     return model
 
-def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode='train', train_params={}, model_params={}):
+def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode='train', train_params={}, model_params={}, alternate_train_threshold=None):
     device = train_params['device']
     clip_max_norm = 1
     if mode=="train":
@@ -316,7 +335,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss_kld = kl_anneal_function(step) * loss_f["KLD"](preds_mu, preds_logvar)
                 loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                 if train_params["alternate_train"]:
-                    if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
+                    if epoch > alternate_train_threshold:
                         loss = loss_y + loss_recon + loss_kld
                     else:
                         loss = loss_recon + loss_kld
@@ -411,7 +430,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     loss_kld = kl_anneal_function(step) * loss_f["KLD"](preds_mu, preds_logvar)
                     loss_y = train_params["loss_weights"]["y"] * loss_f["y"](preds_y, trues_y)
                     if train_params["alternate_train"]:
-                        if epoch > train_params["max_epochs"] - max(20, int(train_params["max_epochs"] * 0.2)):
+                        if epoch > alternate_train_threshold:
                             loss = loss_y + loss_recon + loss_kld
                         else:
                             loss = loss_recon + loss_kld
