@@ -1,4 +1,4 @@
-![image](https://github.com/glee2/TOA-using-generative-predictive-models/assets/18283601/313675e2-8a63-489d-918d-c37e7574fddb)# TOA using generative and predictive models
+# TOA using generative and predictive models
 Seek your fortune!: Technological impact-guided technology opportunity analysis using generative-predictive machine learning models
 
 ### 프로젝트 배경 및 필요성
