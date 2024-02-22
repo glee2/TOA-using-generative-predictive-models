@@ -166,42 +166,6 @@ class EncoderLayer(nn.Module):
 
         return ffn_outputs, attn_prob
 
-# class Encoder(nn.Module):
-#     def __init__(self, config, tokenizer=None):
-#         super().__init__()
-#         self.config = config
-#         self.device = self.config.device
-#         self.tokenizer = tokenizer
-#         self.d_hidden =  self.config.d_enc_hidden
-#
-#         self.enc_emb = nn.Embedding(self.tokenizer.vocab_size, self.config.d_hidden)
-#         sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_enc_seq + 1, self.config.d_hidden), dtype=torch.float32)
-#         self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True)
-#
-#         self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config.n_layers)])
-#
-#     def forward(self, input_ids, attention_mask):
-#         # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
-#
-#         inputs = input_ids
-#
-#         positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
-#         pos_mask = inputs.eq(self.config.i_padding)
-#         positions.masked_fill_(pos_mask, 0)
-#
-#         outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
-#         outputs = outputs.to(dtype=torch.float32)
-#
-#         attn_mask = get_pad_mask(inputs, inputs, self.config.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
-#
-#         attn_probs = []
-#         for layer in self.layers:
-#             outputs, attn_prob = layer(outputs, attn_mask)
-#             # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
-#             attn_probs.append(attn_prob)
-#
-#         return outputs, attn_probs
-
 class DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -473,9 +437,7 @@ class VCLS2CLS(nn.Module):
         class_encoder = Encoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_enc"])
         self.encoders = nn.ModuleDict({"claim": claim_encoder, "class": class_encoder})
 
-        # self.hidden2latent = nn.Linear(self.d_hidden * self.hidden_factor, self.d_latent)
         self.latent2hidden = nn.Linear(self.d_latent, self.d_hidden * self.hidden_factor)
-        # self.decoder = AttnDecoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_dec"])
         self.decoder = Decoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_dec"])
         self.predictor = Predictor(self.config) if "pred" in self.model_type else None
         self.pooling_strategy = "max"
@@ -598,125 +560,6 @@ class VCLS2CLS(nn.Module):
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps * std + mu
-
-class CLS2CLS(nn.Module):
-    def __init__(self, config={}, tokenizers=None):
-        super(CLS2CLS, self).__init__()
-        self.config = config
-        for key, value in config.items():
-            setattr(self, key, value)
-        self.tokenizers = tokenizers
-        self.hidden_factor = self.n_directions * self.n_layers
-
-        if self.pretrained_enc:
-            claim_encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
-            claim_encoder.config.output_attentions = True
-            claim_encoder.d_hidden = 768
-            for p in claim_encoder.parameters():
-                p.requires_grad = False
-        else:
-            claim_encoder = Encoder_Transformer(self.config, tokenizer=self.tokenizers["claim_enc"])
-
-        class_encoder = Encoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_enc"])
-        self.encoders = nn.ModuleDict({"claim": claim_encoder, "class": class_encoder})
-
-        self.hidden2latent = nn.Linear(self.d_hidden * self.hidden_factor, self.d_latent) # where variational put into
-        self.latent2hidden = nn.Linear(self.d_latent, self.d_hidden * self.hidden_factor)
-        self.decoder = AttnDecoder_SEQ(config=self.config, tokenizer=config.tokenizers["class_dec"])
-        self.predictor = Predictor(self.config) if "pred" in self.model_type else None
-
-    def forward(self, enc_inputs, dec_inputs, teach_force_ratio=0.75):
-        if isinstance(enc_inputs, dict):
-            batch_size = enc_inputs["class"].size(0)
-        else:
-            batch_size = enc_inputs.size(0)
-
-        enc_outputs, z = self.encode(enc_inputs)
-        pred_outputs = self.predict(z)
-        if z.device != self.device:
-            curr_device = z.device
-        else:
-            curr_device = self.device
-        dec_outputs = self.decode(z, enc_outputs["class"], dec_inputs, device=curr_device, teach_force_ratio=teach_force_ratio)
-
-        return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs}
-
-    def freeze(self, module_name, defreeze=False):
-        modules = {"decoder": self.decoder, "predictor": self.predictor, "claim_encoder": self.encoders["claim"], "class_encoder": self.encoders["class"]}
-        module = modules[module_name]
-        for p in module.parameters():
-            p.requires_grad = defreeze
-
-    def encode(self, enc_inputs):
-        batch_size = enc_inputs["class"].size(0)
-        enc_outputs = {}
-        if self.pretrained_enc:
-            enc_outputs_base = self.encoders["claim"](**enc_inputs["claim"])
-            enc_outputs["claim"] = enc_outputs_base.last_hidden_state
-        else:
-            enc_outputs["claim"], *_ = self.encoders["claim"](**enc_inputs["claim"]) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
-
-        enc_outputs["class"], hidden = self.encoders["class"](enc_inputs["class"]) # enc_outputs: (batch_size, n_enc_seq_class, d_hidden * n_directions), hidden: (hidden_factor, batch_size, d_hidden)
-
-        if self.bidirec or self.n_layers > 1:
-            # flatten hidden states
-            hidden = hidden.permute(1,0,2).contiguous().view(batch_size, -1)
-        else:
-            hidden = hidden.squeeze()
-
-        z = self.hidden2latent(hidden)
-
-        return enc_outputs, z
-
-    def predict(self, z):
-        return self.predictor(z)
-
-    def decode(self, z, enc_outputs, dec_inputs=None, batch_size=None, device=None, teach_force_ratio=0.75):
-        if device is None:
-            device = self.device
-        if batch_size is None:
-            batch_size = z.size(0)
-
-        next_hidden = self.latent2hidden(z)
-
-        if self.bidirec or self.n_layers > 1:
-            # unflatten hidden states
-            next_hidden = next_hidden.view(batch_size, self.d_hidden, self.hidden_factor).permute(2,0,1).contiguous()
-        else:
-            next_hidden = next_hidden.unsqueeze(0)
-
-        next_input = torch.tensor(np.tile([self.tokenizers["class_enc"].vocab_w2i["<SOS>"]], batch_size), device=device) # (batch_size)
-
-        dec_outputs = torch.zeros((batch_size, self.n_dec_seq_class, self.tokenizers["class_dec"].vocab_size), device=device) # (batch_size, vocab_size, seq_len)
-
-        for t in range(1, self.n_dec_seq_class):
-            output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, enc_outputs)
-            # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim * n_directions), pred_token: (batch_size)
-
-            if dec_inputs is not None:
-                rand_num = np.random.random()
-                if rand_num < teach_force_ratio:
-                    next_input = dec_inputs[:,t] # (batch_size)
-                else:
-                    next_input = pred_token # (batch_size)
-            else:
-                next_input = pred_token
-            dec_outputs[:,t,:] = output
-
-        return dec_outputs
-
-    def pred_next(self, next_input, next_hidden, enc_outputs):
-        output, hidden = self.decoder(next_input, next_hidden, enc_outputs)
-        # output, hidden = self.decoder(next_input, next_hidden)
-        # output: (batch_size, vocab_size), hidden: (n_layers, batch_size, hidden_dim * n_directions)
-
-        pred_token = output.argmax(1) # (batch_size)
-        if output.size(0) != 1: pred_token = pred_token.squeeze(0)
-
-        if pred_token.size() == torch.Size([]):
-            print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
-
-        return output, hidden, pred_token
 
 class Predictor(nn.Module):
     def __init__(self, config):

@@ -374,7 +374,7 @@ if __name__=="__main__":
         fname_datasets_to_save = "[DATASET]"+current_datetime+".xlsx"
         with pd.ExcelWriter(os.path.join(configs.data.result_dir, fname_datasets_to_save)) as writer:
             tech_dataset.data.iloc[whole_idx].to_excel(writer, sheet_name="TRAIN_dataset")
-            tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")        
+            tech_dataset.data.iloc[test_idx].to_excel(writer, sheet_name="TEST_dataset")
 
         ''' PART 3-3: Training evaluation '''
         if args.eval_train_set:

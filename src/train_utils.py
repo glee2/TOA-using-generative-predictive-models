@@ -169,9 +169,7 @@ def build_model(model_params={}, trial=None, tokenizers=None):
         model_params['d_head'] = trial.suggest_categorical("d_head", [x for x in np.arange(model_params["for_tune"]["min_d_head"],model_params["for_tune"]["max_d_head"]+1,step=model_params["for_tune"]["min_d_head"]) if model_params["for_tune"]["max_d_head"]%x==0])
         model_params['d_latent'] = trial.suggest_int("d_latent", model_params['d_hidden'] * model_params['n_enc_seq'], model_params['d_hidden'] * model_params['n_enc_seq'])
 
-    # model = Transformer(model_params, tokenizers=tokenizers).to(device)
     model = VCLS2CLS(model_params, tokenizers=tokenizers).to(device)
-    # model = CLS2CLS(model_params, tokenizers=tokenizers).to(device)
     if re.search("^2.", torch.__version__) is not None:
         print("INFO: PyTorch 2.* imported, compile model")
         model = torch.compile(model)
