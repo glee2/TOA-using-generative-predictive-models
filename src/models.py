@@ -1,12 +1,12 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.0
-Description (primary changes): Last version before integration into master branch
+Version: 1.2
+Description (primary changes): Claim + class -> class
 '''
 
 # Set root directory
-root_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
+root_dir = '/home2/glee/dissertation/1_tech_gen_impact/class2class/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
@@ -20,9 +20,13 @@ import numpy as np
 import torch
 from torch import nn, optim
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.autograd import Variable
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from transformers import DistilBertModel
+from transformers import T5ForConditionalGeneration, T5Config
+
+from utils import top_k_top_p_filtering
 
 ## weight initialization
 def init_weights(m):
@@ -162,40 +166,6 @@ class EncoderLayer(nn.Module):
 
         return ffn_outputs, attn_prob
 
-class Encoder(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.device = self.config.device
-
-        self.enc_emb = nn.Embedding(self.config.n_enc_vocab, self.config.d_hidden).to(self.device)
-        sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_enc_seq + 1, self.config.d_hidden), dtype=torch.float64).to(self.device)
-        self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True).to(self.device)
-
-        self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.config.n_layers)])
-
-    def forward(self, input_ids, attention_mask):
-        # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
-
-        inputs = input_ids
-
-        positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
-        pos_mask = inputs.eq(self.config.i_padding)
-        positions.masked_fill_(pos_mask, 0)
-
-        outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
-        outputs = outputs.to(dtype=torch.float32)
-
-        attn_mask = get_pad_mask(inputs, inputs, self.config.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
-
-        attn_probs = []
-        for layer in self.layers:
-            outputs, attn_prob = layer(outputs, attn_mask)
-            # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
-            attn_probs.append(attn_prob)
-
-        return outputs, attn_probs
-
 class DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -224,18 +194,19 @@ class DecoderLayer(nn.Module):
         return ffn_outputs, dec_self_attn_prob, dec_enc_attn_prob
 
 class Decoder(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, tokenizer=None):
         super().__init__()
         self.config = config
         self.device = self.config.device
+        self.tokenizer = tokenizer
 
-        self.dec_emb = nn.Embedding(self.config.n_dec_vocab, self.config.d_hidden).to(self.device)
+        self.dec_emb = nn.Embedding(self.tokenizer.vocab_size, self.config.d_hidden).to(self.device)
         sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.config.n_dec_seq + 1, self.config.d_hidden), dtype=torch.float64).to(self.device)
         self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True).to(self.device)
 
         self.layers = nn.ModuleList([DecoderLayer(self.config) for _ in range(self.config.n_layers)])
 
-        self.out = nn.Linear(self.config.d_hidden, self.config.n_dec_vocab).to(self.device)
+        self.out = nn.Linear(self.config.d_hidden, self.tokenizer.vocab_size).to(self.device)
 
     def forward(self, dec_inputs, enc_inputs, enc_outputs):
         # dec_inputs: (batch_size, n_dec_seq), enc_inputs: (batch_size, n_enc_seq), enc_outputs: (batch_size, n_enc_seq, d_hidden)
@@ -263,18 +234,343 @@ class Decoder(nn.Module):
 
         return dec_outputs, dec_self_attn_probs, dec_enc_attn_probs
 
+class Transformer(nn.Module):
+    def __init__(self, config, tokenizers=None):
+        super(Transformer, self).__init__()
+        self.config = config
+        self.device = self.config.device
+        self.pooling_strategy = "max"
+        if tokenizers is not None:
+            self.tokenizers = tokenizers
+        else:
+            self.tokenizers = self.config.tokenizers
+
+        if self.config.pretrained_enc:
+            self.encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
+            self.encoder.config.output_attentions = True
+        else:
+            self.encoder = Encoder(self.config)
+        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
+        if self.config.pretrained_dec:
+            self.t5config = T5Config.from_pretrained("t5-small")
+            self.t5model = T5ForConditionalGeneration.from_pretrained("t5-small", config=self.t5config).to(self.device)
+            self.decoder = self.t5model.decoder
+            self.lm_head = self.t5model.lm_head
+            self.sizematching_layer = nn.Linear(self.config.d_enc_hidden, self.t5config.d_model)
+            self.mu = nn.Linear(self.t5config.d_model, self.config.d_latent, bias=False)
+            self.logvar = nn.Linear(self.t5config.d_model, self.config.d_latent, bias=False)
+            self.embed_size_per_head = self.t5config.d_model // self.t5config.num_heads
+            self.memory_projection = nn.Linear(
+                self.config.d_latent,
+                self.t5config.num_decoder_layers * self.t5config.num_heads * self.embed_size_per_head,
+                bias=False,
+            )
+        else:
+            self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
+            self.t5model = self.lm_head = self.embed_size_per_head = self.memory_projection = None
+            self.mu = nn.Linear(self.config.d_enc_hidden, self.config.d_latent, bias=False)
+            self.logvar = nn.Linear(self.config.d_enc_hidden, self.config.d_latent, bias=False)
+
+    def forward(self, enc_inputs, dec_inputs):
+        z = self.encode(enc_inputs)
+
+        if self.predictor is not None:
+            pred_outputs = self.predict(z)
+        else:
+            pred_outputs = None
+
+        if self.decoder is not None:
+            if self.config.pretrained_dec:
+                dec_outputs = self.decode(dec_inputs=dec_inputs, z=z)
+            else:
+                dec_outputs = self.decode(dec_inputs=dec_inputs, enc_inputs=enc_inputs, enc_outputs=enc_outputs)
+
+        return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs}
+
+    def freeze(self, module=None):
+        if module=="decoder":
+            for p in self.decoder.parameters():
+                p.requires_grad = False
+            if self.config.pretrained_dec:
+                for p in self.lm_head.parameters():
+                    p.requires_grad = False
+                for p in self.memory_projection.parameters():
+                    p.requires_grad = False
+        elif module=="predictor":
+            for p in self.predictor.parameters():
+                p.requires_grad = False
+
+    def defreeze(self, module=None):
+        if module=="decoder":
+            for p in self.decoder.parameters():
+                p.requires_grad = True
+            if self.config.pretrained_dec:
+                for p in self.lm_head.parameters():
+                    p.requires_grad = False
+                for p in self.memory_projection.parameters():
+                    p.requires_grad = False
+            else:
+                for p in self.decoder.pos_emb.parameters():
+                    p.requires_grad = False
+        elif module=="predictor":
+            for p in self.predictor.parameters():
+                p.requires_grad = True
+
+    def encode(self, enc_inputs):
+        if self.config.pretrained_enc:
+            enc_outputs_base = self.encoder(**enc_inputs)
+            enc_outputs, enc_self_attn_probs = enc_outputs_base.last_hidden_state, enc_outputs_base.attentions
+        else:
+            enc_outputs, enc_self_attn_probs = self.encoder(**enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
+
+        pooled = self.pool(enc_outputs)
+        z, mu, logvar = self.calculate_latent(pooled)
+
+        return z
+
+    def predict(self, z):
+        return self.predictor(z)
+
+    def decode(self, enc_inputs=None, enc_outputs=None, dec_inputs=None, z=None):
+        if self.config.pretrained_dec:
+            batch_size = z.shape[0]
+        else:
+            batch_size = enc_inputs["input_ids"].shape[0]
+        if dec_inputs is not None:
+            if self.config.pretrained_dec:
+                past_key_values = self.build_past(z)
+                dec_inputs = {"input_ids": dec_inputs["input_ids"][:,1:], "attention_mask": dec_inputs["attention_mask"]}
+                dec_outputs = self.lm_head(self.decoder(**dec_inputs, past_key_values=past_key_values).last_hidden_state)
+            else:
+                dec_inputs = dec_inputs["input_ids"][:,:-1]
+                dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        else:
+            if self.config.pretrained_dec:
+                preds_recon_batch = torch.tile(torch.tensor(self.t5config.decoder_start_token_id, device=self.device), dims=(batch_size,1)).to(device=self.device)
+                past_key_values = self.build_past(z)
+
+                for i in range(self.config.n_dec_seq - 1):
+                    dec_outputs = self.decoder(input_ids=preds_recon_batch[:, -1].unsqueeze(1), past_key_values=past_key_values)
+                    logits = self.lm_head(dec_outputs.last_hidden_state)
+                    past_key_values = dec_outputs.past_key_values
+
+                    pred_tokens = logits.argmax(2)[:,-1].unsqueeze(1)
+
+                    preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
+                    torch.cuda.empty_cache()
+
+                dec_outputs = preds_recon_batch
+            else:
+                preds_recon_batch = torch.tile(torch.tensor(self.tokenizers["dec"].token_to_id("<SOS>"), device=self.device), dims=(batch_size,1)).to(device=self.device)
+
+                for i in range(self.config.n_dec_seq - 1):
+                    dec_outputs, *_ = self.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
+                    pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
+                    preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
+                    torch.cuda.empty_cache()
+
+                dec_outputs = preds_recon_batch
+
+        return dec_outputs
+
+    def pool(self, x):
+        if self.pooling_strategy == "mean":
+            out = x.mean(dim=1)
+        elif self.pooling_strategy == "max":
+            out = torch.max(x, dim=1)[0]
+        else:
+            raise Exception("Wrong pooling strategy!")
+
+        if self.config.pretrained_dec:
+            if x.shape[1] != self.t5config.d_model:
+                out = self.sizematching_layer(out)
+
+        return out
+
+    def calculate_latent(self, pooled):
+        mu, logvar = self.mu(pooled), self.logvar(pooled)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        """
+        Reparameterization trick to sample from N(mu, var) from
+        N(0,1).
+        :param mu: (Tensor) Mean of the latent Gaussian [B x D]
+        :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
+        :return: (Tensor) [B x D]
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
+    def build_past(self, z):
+        projection = self.memory_projection(z)
+        cross_attn = projection.reshape(
+            self.t5config.num_decoder_layers,
+            projection.shape[0],
+            self.t5config.num_heads,
+            1,
+            self.embed_size_per_head,
+        )
+        past_key_values = tuple((ca, ca) for ca in cross_attn)
+        return past_key_values
+
+class VCLS2CLS(nn.Module):
+    def __init__(self, config={}, tokenizers=None):
+        super(VCLS2CLS, self).__init__()
+        self.config = config
+        for key, value in config.items():
+            setattr(self, key, value)
+        self.tokenizers = tokenizers
+        self.hidden_factor = self.n_directions * self.n_layers
+
+        if self.pretrained_enc:
+            claim_encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
+            claim_encoder.config.output_attentions = True
+            claim_encoder.d_hidden = 768
+            for p in claim_encoder.parameters():
+                p.requires_grad = False
+        else:
+            claim_encoder = Encoder_Transformer(self.config, tokenizer=self.tokenizers["claim_enc"])
+
+        class_encoder = Encoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_enc"])
+        self.encoders = nn.ModuleDict({"claim": claim_encoder, "class": class_encoder})
+
+        self.latent2hidden = nn.Linear(self.d_latent, self.d_hidden * self.hidden_factor)
+        self.decoder = Decoder_SEQ(config=self.config, tokenizer=self.tokenizers["class_dec"])
+        self.predictor = Predictor(self.config) if "pred" in self.model_type else None
+        self.pooling_strategy = "max"
+        self.mu = nn.Linear(self.d_hidden + (self.d_hidden * self.n_directions * self.n_layers), self.d_latent, bias=False)
+        self.logvar = nn.Linear(self.d_hidden + (self.d_hidden * self.n_directions * self.n_layers), self.d_latent, bias=False)
+
+    def forward(self, enc_inputs, dec_inputs, teach_force_ratio=0.75):
+        if isinstance(enc_inputs, dict):
+            batch_size = enc_inputs["class"].size(0)
+        else:
+            batch_size = enc_inputs.size(0)
+
+        enc_outputs, z, mu, logvar = self.encode(enc_inputs)
+        pred_outputs = self.predict(z)
+        if z.device != self.device:
+            curr_device = z.device
+        else:
+            curr_device = self.device
+        dec_outputs = self.decode(z, enc_outputs["class"], dec_inputs, device=curr_device, teach_force_ratio=teach_force_ratio)
+
+        return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs, "mu": mu, "logvar": logvar}
+
+    def freeze(self, module_name, defreeze=False):
+        modules = {"decoder": self.decoder, "predictor": self.predictor, "claim_encoder": self.encoders["claim"], "class_encoder": self.encoders["class"]}
+        module = modules[module_name]
+        for p in module.parameters():
+            p.requires_grad = defreeze
+
+    def encode(self, enc_inputs):
+        batch_size = enc_inputs["class"].size(0)
+        enc_outputs = {}
+        hiddens = {}
+        if self.pretrained_enc:
+            enc_outputs_base = self.encoders["claim"](**enc_inputs["claim"])
+            enc_outputs["claim"] = enc_outputs_base.last_hidden_state
+        else:
+            enc_outputs["claim"], *_ = self.encoders["claim"](**enc_inputs["claim"]) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
+
+        hiddens["claim"] = self.pool(enc_outputs["claim"])
+
+        enc_outputs["class"], hiddens["class"] = self.encoders["class"](enc_inputs["class"]) # enc_outputs: (batch_size, n_enc_seq_class, d_hidden * n_directions), hidden: (hidden_factor, batch_size, d_hidden)
+
+        if self.bidirec or self.n_layers > 1:
+            # flatten hidden states
+            hiddens["class"] = hiddens["class"].permute(1,0,2).contiguous().view(batch_size, -1)
+        else:
+            hiddens["class"] = hiddens["class"].squeeze()
+
+        hiddens_cat = torch.cat(list(hiddens.values()), dim=1)
+        z, mu, logvar = self.calculate_latent(hiddens_cat)
+
+        return enc_outputs, z, mu, logvar
+
+    def predict(self, z):
+        return self.predictor(z)
+
+    def decode(self, z, enc_outputs, dec_inputs=None, batch_size=None, device=None, teach_force_ratio=0.75):
+        if device is None:
+            device = self.device
+        if batch_size is None:
+            batch_size = z.size(0)
+
+        next_hidden = self.latent2hidden(z)
+
+        if self.bidirec or self.n_layers > 1:
+            # unflatten hidden states
+            next_hidden = next_hidden.view(batch_size, self.d_hidden, self.hidden_factor).permute(2,0,1).contiguous()
+        else:
+            next_hidden = next_hidden.unsqueeze(0)
+
+        next_input = torch.tensor(np.tile([self.tokenizers["class_enc"].vocab_w2i["<SOS>"]], batch_size), device=device) # (batch_size)
+
+        dec_outputs = torch.zeros((batch_size, self.n_dec_seq_class, self.tokenizers["class_dec"].vocab_size), device=device) # (batch_size, vocab_size, seq_len)
+
+        for t in range(1, self.n_dec_seq_class):
+            output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, enc_outputs)
+            # output: (batch_size, vocab_size), hidden: (batch_size, hidden_dim * n_directions), pred_token: (batch_size)
+
+            if dec_inputs is not None:
+                rand_num = np.random.random()
+                if rand_num < teach_force_ratio:
+                    next_input = dec_inputs[:,t] # (batch_size)
+                else:
+                    next_input = pred_token # (batch_size)
+            else:
+                next_input = pred_token
+            dec_outputs[:,t,:] = output
+
+        return dec_outputs
+
+    def pred_next(self, next_input, next_hidden, enc_outputs):
+        # output, hidden = self.decoder(next_input, next_hidden, enc_outputs)
+        output, hidden = self.decoder(next_input, next_hidden)
+        # output: (batch_size, vocab_size), hidden: (n_layers, batch_size, hidden_dim * n_directions)
+
+        pred_token = output.argmax(1) # (batch_size)
+        if output.size(0) != 1: pred_token = pred_token.squeeze(0)
+
+        if pred_token.size() == torch.Size([]):
+            print(output.shape, hidden.shape, pred_token.shape, next_input.shape)
+
+        return output, hidden, pred_token
+
+    def pool(self, x):
+        if self.pooling_strategy == "mean":
+            out = x.mean(dim=1)
+        elif self.pooling_strategy == "max":
+            out = torch.max(x, dim=1)[0]
+        else:
+            raise Exception("Wrong pooling strategy!")
+
+        return out
+
+    def calculate_latent(self, pooled):
+        mu, logvar = self.mu(pooled), self.logvar(pooled)
+        z = self.reparameterize(mu, logvar)
+        return z, mu, logvar
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
+
 class Predictor(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.device = self.config.device
+        for key, value in config.items():
+            setattr(self, key, value)
+        # self.device = self.config.device
 
-        self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
-        # self.layers = self.set_layers(self.config.d_latent, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
-        self.layers = self.set_layers(self.config.d_hidden, self.config.d_hidden, self.config.n_outputs, self.config.n_layers_predictor)
-        self.softmax = nn.Softmax()
+        self.layers = self.set_layers(self.d_latent, self.d_pred_hidden, self.n_outputs, self.n_layers_predictor)
         self.log_softmax = nn.LogSoftmax(dim=1)
-        self.sigmoid = nn.Sigmoid()
         self.relu = nn.ReLU()
 
     def set_layers(self, d_input, d_hidden, n_outputs, n_layers):
@@ -297,101 +593,184 @@ class Predictor(nn.Module):
         return layers
 
     def forward(self, x):
-        # x (enc_outputs): (batch_size, n_enc_seq, d_hidden)
         batch_size = x.size(0)
-
-        if self.config.take_last_h:
-            x = x[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-        else:
-            attn_weighted = self.attn_weight(x) # attn_weighted: (batch_size, n_enc_seq, 1)
-            x = torch.bmm(attn_weighted.transpose(-1, 1), x).squeeze() # z: (batch_size, d_hidden)
-
         for layer in self.layers:
             x = layer(x)
-        out = x if batch_size > 1 else x.unsqueeze(0)
+        # out = x if batch_size > 1 else x.unsqueeze(0)
+        out = x
         out = self.log_softmax(out)
-        # out = self.sigmoid(out)
-        # out = self.relu(out)
 
         return out
 
-class Transformer(nn.Module):
+class Encoder_Transformer(nn.Module):
     def __init__(self, config, tokenizer=None):
-        super(Transformer, self).__init__()
+        super().__init__()
         self.config = config
-        self.device = self.config.device
+        for key, value in config.items():
+            setattr(self, key, value)
+        # self.device = self.config.device
         self.tokenizer = tokenizer
+        # self.d_hidden =  self.d_hidden
 
-        if self.config.is_pretrained:
-            self.encoder = DistilBertModel.from_pretrained("distilbert-base-uncased")
-            self.encoder.config.output_attentions = True
+        self.enc_emb = nn.Embedding(self.tokenizer.vocab_size, self.d_hidden)
+        sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.n_enc_seq_claim + 1, self.d_hidden), dtype=torch.float32)
+        self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True)
+
+        self.layers = nn.ModuleList([EncoderLayer(self.config) for _ in range(self.n_layers)])
+
+    def forward(self, input_ids, attention_mask):
+        # input_ids: (batch_size, n_enc_seq), attention_mask: (batch_size, n_enc_seq)
+
+        inputs = input_ids
+
+        positions = torch.arange(inputs.size(1), device=inputs.device, dtype=inputs.dtype).expand(inputs.size(0), inputs.size(1)).contiguous() + 1 # positions: (batch_size, n_enc_seq)
+        pos_mask = inputs.eq(self.i_padding)
+        positions.masked_fill_(pos_mask, 0)
+
+        outputs = self.enc_emb(inputs) + self.pos_emb(positions) # outputs: (batch_size, n_enc_seq, d_hidden)
+        outputs = outputs.to(dtype=torch.float32)
+
+        attn_mask = get_pad_mask(inputs, inputs, self.i_padding) # attn_mask: (batch_size, n_enc_seq, n_enc_seq)
+
+        attn_probs = []
+        for layer in self.layers:
+            outputs, attn_prob = layer(outputs, attn_mask)
+            # outputs: (batch_size, n_enc_seq, d_hidden), attn_prob: (batch_size, n_head, n_enc_seq, n_enc_seq)
+            attn_probs.append(attn_prob)
+
+        return outputs, attn_probs
+
+class Encoder_SEQ(nn.Module):
+    def __init__(self, config={}, tokenizer=None):
+        super(Encoder_SEQ, self).__init__()
+        self.config = config
+        for key, value in config.items():
+            setattr(self, key, value)
+        # self.device = self.config.device
+        self.tokenizer = tokenizer
+        # self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
+
+        self.gru = nn.GRU(self.d_embedding, self.d_hidden, self.n_layers, batch_first=True, bidirectional=self.bidirec).to(self.device)
+        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding, padding_idx=self.i_padding).to(self.device)
+        self.dropout = nn.Dropout(self.p_dropout).to(self.device)
+        # self.fc = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
+
+    def forward(self, inputs):
+        # inputs: (batch_size, seq_len)
+        batch_size = inputs.shape[0]
+
+        embedded = self.dropout(self.embedding(inputs)) # (batch_size, seq_len, embedding_dim)
+        hidden = self.initHidden(batch_size) # (n_layers * n_directions, batch_size, hidden_dim)
+        if inputs.device != hidden.device: hidden = hidden.to(inputs.device)
+        batch_lengths = (inputs==self.tokenizer.eos_id).nonzero()[:,-1]
+        sorted_lengths, sorted_idxs = torch.sort(batch_lengths, descending=True)
+        packed_input = pack_padded_sequence(embedded, sorted_lengths.data.tolist(), batch_first=True)
+        output, hidden = self.gru(packed_input, hidden)
+        padded_output, *_ = pad_packed_sequence(output, total_length=self.n_enc_seq_class, batch_first=True)
+        padded_output = padded_output.contiguous()
+        _, reversed_idxs = torch.sort(sorted_idxs)
+        padded_output = padded_output[reversed_idxs]
+        output = padded_output
+
+        return output, hidden
+
+    def initHidden(self, batch_size):
+        return torch.zeros((self.n_layers * self.n_directions, batch_size, self.d_hidden), device=self.device)
+
+class Decoder_SEQ(nn.Module):
+    def __init__(self, config={}, tokenizer=None):
+        super().__init__()
+        self.config = config
+        for key, value in config.items():
+            setattr(self, key, value)
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+
+        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding)
+        self.dropout = nn.Dropout(self.p_dropout)
+        self.gru = nn.GRU(self.d_embedding, self.d_hidden, self.n_layers, batch_first=True, bidirectional=self.bidirec)
+        self.fc_out = nn.Linear(self.d_hidden * self.n_directions, self.tokenizer.vocab_size)
+
+    def forward(self, inputs, hidden=None):
+        inputs = inputs.unsqueeze(1)
+
+        if hidden is not None:
+            if len(hidden.size()) < 3: # last hidden state from encoder (when starting decoding)
+                hidden = hidden.unsqueeze(0).repeat(self.n_layers, 1, 1)
         else:
-            self.encoder = Encoder(self.config)
-        self.predictor = Predictor(self.config) if "pred" in self.config.model_type else None
-        # if self.predictor is not None:
-        #     self.attn_weight = nn.Sequential(nn.Linear(self.config.d_hidden, 1), nn.Softmax(dim=1))
-        self.decoder = Decoder(self.config) if "dec" in self.config.model_type else None
+            hidden = self.initHidden(len(inputs))
+            if inputs.device != hidden.device: hidden = hidden.to(inputs.device)
 
-    def forward(self, enc_inputs, dec_inputs):
-        # enc_inputs: (batch_size, n_enc_seq), dec_inputs: (batch_size, n_dec_seq)
-        if self.config.is_pretrained:
-            enc_outputs_base = self.encoder(**enc_inputs)
-            enc_outputs, enc_self_attn_probs = enc_outputs_base.last_hidden_state, enc_outputs_base.attentions
-        else:
-            enc_outputs, enc_self_attn_probs = self.encoder(**enc_inputs) # enc_outputs: (batch_size, n_enc_seq, d_hidden)
-        if self.predictor is not None:
-            pred_outputs = self.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
-            if self.config.take_last_h:
-                z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-            else:
-                attn_weighted = self.predictor.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
-                z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
-            # pred_outputs = self.predictor(z) # pred_outputs: (batch_size, n_outputs)
-        else:
-            pred_outputs = None
+        embedded = self.dropout(self.embedding(inputs))
+        output, hidden = self.gru(embedded, hidden)
+        prediction = self.fc_out(output.squeeze(1))
+        # prediction = self.log_softmax(prediction)
 
-        if self.decoder is not None:
-            dec_outputs, dec_self_attn_probs, dec_enc_attn_probs = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
-        else:
-            dec_outputs = dec_self_attn_probs = dec_enc_attn_probs = None
+        return prediction, hidden
 
-        # return dec_outputs, enc_self_attn_probs, dec_self_attn_probs, dec_enc_attn_probs, enc_outputs, pred_outputs
+    def initHidden(self, batch_size):
+        return torch.zeros((self.n_layers, batch_size, self.d_hidden))
 
-        return {"dec_outputs": dec_outputs, "z": z, "pred_outputs": pred_outputs}
-        #, "enc_outputs": enc_outputs, "enc_self_attn_probs": enc_self_attn_probs, "dec_self_attn_probs": dec_self_attn_probs, "dec_enc_attn_probs": dec_enc_attn_probs}
+class Attention(nn.Module):
+    def __init__(self, config={}):
+        super(Attention, self).__init__()
+        self.config = config
+        for key, value in config.items():
+            setattr(self, key, value)
+        self.d_attn_hidden = self.d_hidden + (self.d_hidden * self.n_directions)
+        self.attn = nn.Linear(self.d_attn_hidden, self.d_hidden).to(self.device)
+        self.v = nn.Linear(self.d_hidden, 1, bias=False).to(self.device)
 
-    def encode(self, enc_inputs):
-        enc_outputs, *_ = self.encoder(**enc_inputs)
-        # if self.config.take_last_h:
-        #     z = enc_outputs[:, -1, :] # z: (batch_size, d_hidden) - Take last hidden states from enc_outputs
-        # else:
-        #     attn_weighted = self.attn_weight(enc_outputs) # attn_weighted: (batch_size, n_enc_seq, 1)
-        #     z = torch.bmm(attn_weighted.transpose(-1, 1), enc_outputs).squeeze() # z: (batch_size, d_hidden)
+    def forward(self, hidden, enc_outputs):
+        # hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
 
-        # return z
-        return enc_outputs
+        batch_size = enc_outputs.shape[0]
+        seq_len = enc_outputs.shape[1]
 
-    def predict(self, z):
-        return self.predictor(z)
+        hidden_last = hidden[-1] # (batch_size, hidden_dim * n_directions)
 
-    def decode(self, enc_inputs, enc_outputs, dec_inputs=None):
-        batch_size = enc_inputs["input_ids"].shape[0]
+        hidden = hidden_last.unsqueeze(1).repeat(1, seq_len, 1) # (batch_size, seq_len, hidden_dim * n_directions)
 
-        if dec_inputs is not None:
-            dec_outputs, *_ = self.decoder(dec_inputs, enc_inputs["input_ids"], enc_outputs) # dec_outputs: (batch_size, n_dec_seq, d_hidden)
+        energy = torch.tanh(self.attn(torch.cat((hidden, enc_outputs), dim=2))) # (batch_size, seq_len, hidden_dim)
+        attention = self.v(energy).squeeze(2) # (batch_size, seq_len)
 
-        else:
-            # if str(self.tokenizer.__class__).split("\"")[1].split(".")[0] == "transformers":
-            #     preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.convert_tokens_to_ids("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
-            # elif str(self.tokenizer.__class__).split("\'")[1].split(".")[0] == "tokenizers":
-            preds_recon_batch = torch.tile(torch.tensor(self.tokenizer.token_to_id("<SOS>"), device=self.config.device), dims=(batch_size,1)).to(device=self.config.device)
+        return F.softmax(attention, dim=1)
 
-            for i in range(self.config.n_dec_seq - 1):
-                dec_outputs, *_ = self.decoder(preds_recon_batch, enc_inputs["input_ids"], enc_outputs)
-                pred_tokens = dec_outputs.argmax(2)[:,-1].unsqueeze(1)
-                preds_recon_batch = torch.cat([preds_recon_batch, pred_tokens], axis=1)
-                torch.cuda.empty_cache()
+class AttnDecoder_SEQ(nn.Module):
+    def __init__(self, config={}, tokenizer=None):
+        super().__init__()
+        self.config = config
+        for key, value in config.items():
+            setattr(self, key, value)
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
 
-            dec_outputs = preds_recon_batch
+        self.attention = Attention(config=self.config)
+        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding).to(self.device)
+        self.gru = nn.GRU((self.d_hidden * self.n_directions) + self.d_embedding, self.d_hidden, self.n_layers, bidirectional=self.bidirec, batch_first=True).to(self.device)
+        self.fc_out = nn.Linear(self.d_embedding + (self.d_hidden * self.n_directions) + (self.d_hidden * self.n_directions), self.tokenizer.vocab_size)
+        self.dropout = nn.Dropout(self.p_dropout).to(self.device)
 
-        return dec_outputs
+    def forward(self, inputs, hidden, enc_outputs):
+        # inputs: (batch_size), hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
+        inputs = inputs.unsqueeze(1) # (batch_size, 1)
+
+        embedded = self.dropout(self.embedding(inputs)) # (batch_size, 1, embedding_dim)
+
+        a = self.attention(hidden, enc_outputs)
+        a = a.unsqueeze(1) # (batch_size, 1, seq_len)
+
+        weighted = torch.bmm(a, enc_outputs) # (batch_size, 1, hidden_dim * n_directions)
+
+        gru_input = torch.cat((embedded, weighted), dim=2) # (batch_size, 1, hidden_dim * n_directions + embedding_dim)
+
+        output, hidden = self.gru(gru_input, hidden) # output: (batch_size, 1, hidden_dim * n_directions), hidden: (n_layers, batch_size, hidden_dim * n_directions)
+
+        embedded = embedded.squeeze(1)
+        weighted = weighted.squeeze(1)
+        output = output.squeeze(1)
+
+        prediction = self.fc_out(torch.cat((embedded, weighted, output), dim=1)) # (batch_size, vocab_size)
+        # prediction = self.log_softmax(prediction)
+
+        return prediction, hidden

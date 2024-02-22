@@ -1,10 +1,11 @@
 models/*
 !models/.keep
 src_backup/*
-src/__pycache__/
+__pycache__/
 src/runs/
-src/.ipynb_checkpoints/
+.ipynb_checkpoints/
 results/*
 !results/.keep
 data/
 !data/.keep
+backup/
