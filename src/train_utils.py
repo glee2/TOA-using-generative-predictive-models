@@ -36,7 +36,7 @@ from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
 
 from data import TechDataset, CVSampler
-from models import Transformer, CLS2CLS, VCLS2CLS
+from models import Transformer, VCLS2CLS
 from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -188,6 +188,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
 
     if train_params["alternate_train"]:
         alternate_train_threshold = train_params["max_epochs"] - max(40, int(train_params["max_epochs"] * 0.6))
+    else: alternate_train_threshold = None
 
     ## Loss function and optimizers
     loss_recon = torch.nn.CrossEntropyLoss(ignore_index=model_params['i_padding'], reduction="sum")
@@ -472,24 +473,45 @@ def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params
     ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in [device_id.index for device_id in train_params["device_ids"]]})
     processes = []
 
-    for device_id in train_params["device_ids"]:
-        device_rank = device_id.index
-        model_rank = copy.deepcopy(model.module)
-        p = mp.Process(name="Subprocess", target=inference_mp, args=(model_rank, device_rank, queue_dataloader, ret_dict, model_params, train_params))
+    chunks = list(torch.arange(len(val_dataset)).chunk(len(train_params["device_ids"])))
+    for device_id, idx_chunk in zip(train_params["device_ids"], chunks):
+        p = mp.Process(
+            name="Subprocess",
+            target=inference_mp,
+            args=(model.module, device_id.index, val_dataset, idx_chunk, ret_dict, model_params, batch_size)
+        )
         p.start()
         processes.append(p)
 
-    data_loaders = [DataLoader(Subset(val_dataset, idx), batch_size=batch_size, num_workers=0) for idx in torch.arange(len(val_dataset)).chunk(train_params["n_gpus"])]
 
-    for rank in range(train_params["n_gpus"]):
-        queue_dataloader.put(data_loaders[rank])
+    # for rank in range(train_params["device_ids"]):
+    #     # queue_dataloader.put(data_loaders[rank])
+        
+    #     indices = torch.arange(len(val_dataset)).chunk(train_params["device_ids"])[rank]
+    #     queue_dataloader.put((indices, batch_size))
+
+    # for device_id in train_params["device_ids"]:
+    #     device_rank = device_id.index
+    #     # model_rank = copy.deepcopy(model.module)
+    #     model_rank = model.module
+    #     p = mp.Process(name="Subprocess", target=inference_mp, args=(model_rank, device_rank, val_dataset, queue_dataloader, ret_dict, model_params, train_params))
+    #     p.start()
+    #     processes.append(p)
+
+    # data_loaders = [DataLoader(Subset(val_dataset, idx), batch_size=batch_size, num_workers=0) for idx in torch.arange(len(val_dataset)).chunk(train_params["n_gpus"])]
+
+    # for rank in range(train_params["device_ids"]):
+    #     # queue_dataloader.put(data_loaders[rank])
+        
+    #     indices = torch.arange(len(val_dataset)).chunk(train_params["device_ids"])[rank]
+    #     queue_dataloader.put((indices, batch_size))
 
     for p in processes:
         p.join()
 
     return ret_dict
 
-def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, train_params):
+def inference_mp(model, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size):
     import torch
     import numpy as np
     from tqdm import tqdm
@@ -497,7 +519,19 @@ def inference_mp(model, device_rank, queue_dataloader, ret_dict, model_params, t
     model = model.to(device=curr_device)
     model.device = curr_device
     with torch.no_grad():
-        data_loader = queue_dataloader.get()
+        try:
+            # indices, batch_size = queue_dataloader.get()
+            # print(type(indices), type(batch_size))
+            subset = Subset(val_dataset, idx_chunk)
+            data_loader = DataLoader(subset, batch_size=batch_size, num_workers=0, pin_memory=False)
+            # print(type(data_loader))
+        except TimeoutError:
+            print(f"[Rank {device_rank}] queue is empty after timeout")
+            return
+        except Exception as e:
+            print(f"[Rank {device_rank}] unexpected error: {e!r}")
+            return
+            
         batch_size = data_loader.batch_size
         trues_recon, trues_recon_kw, trues_y = [], [], []
         preds_recon, preds_y = [], []

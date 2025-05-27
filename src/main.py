@@ -101,7 +101,7 @@ parser.add_argument("--config_file", default=None, type=str)
 parser.add_argument("--analysis_date", default=None, type=str)
 
 if __name__=="__main__":
-    mp.set_start_method("spawn")
+    mp.set_start_method("spawn", force=True)
     current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
 
     ''' PART 1: Configuration '''
