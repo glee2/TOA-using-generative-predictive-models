@@ -38,7 +38,7 @@ from accelerate import Accelerator
 from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss, classification_report
 
 from data import TechDataset, CVSampler
-from models import Transformer, VCLS2CLS
+from models import VCLS2CLS
 from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

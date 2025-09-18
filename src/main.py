@@ -45,7 +45,7 @@ from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, 
 from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
-from models import Transformer, Predictor
+from models import Predictor
 from train_utils import EarlyStopping, perf_eval, objective_cv, build_model, train_model, validate_model_mp
 from utils import token2class, DotDict, to_device
 
