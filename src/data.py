@@ -48,6 +48,35 @@ from cleantext.sklearn import CleanTransformer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+extract_class_pattern = re.compile(
+    r'([A-Za-z])'      # 1) 첫글자
+    r'(\d{2})'         # 2) 두 자리 숫자
+    r'([A-Za-z])'      # 3) 두 번째 문자
+    r'(\d{0,3})'       # 4) pre-슬래시 숫자 (1~3자리)
+    r'/'
+    r'(\d{0,6})'       # 5) post-슬래시 숫자 (1~6자리)
+)
+
+def extract_class_level(code, level):
+    if not isinstance(code, str):
+        return []
+    out = []
+    for m in extract_class_pattern.finditer(code):
+        L1, D2, L2, pre, post = m.groups()
+        pre3  = pre.zfill(3)
+        post6 = post.zfill(6)
+        if level == 1: # Section-Subsection (e.g., "A61")
+            out.append(f"{L1}{D2}")
+        elif level == 2: # Section-Subsection-Class (e.g., "A61K")
+            out.append(f"{L1}{D2}{L2}")
+        elif level == 3: # Section-Subsection-Class-Main group (e.g., "A61K03")
+            out.append(f"{L1}{D2}{L2}{pre3}")
+        elif level == 4: # Section-Subsection-Class-Main group-/-Sub group (e.g., "A61K03/45")
+            out.append(f"{L1}{D2}{L2}{pre3}/{post6}")
+        else:
+            raise ValueError(f"Not implemented for an PC level {level}")
+    return out
+
 class TechDataset(Dataset):
     def __init__(self, config):
         super().__init__()
@@ -67,35 +96,46 @@ class TechDataset(Dataset):
 
     def preprocess(self):
         regex = re.compile("[0-9a-zA-Z\/]+")
-        latest_year = datetime.datetime.now().year-1
+#         latest_year = datetime.datetime.now().year-1
+        latest_year = 2022
         cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
-        rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_ipc', 'sub_ipc', 'claims'])[['number','main_ipc','sub_ipc','claims']]
-        main_ipcs = [x for x in pd.unique(rawdata_dropna['main_ipc'])]
-        assert len(main_ipcs) != 0, "target ipc is not observed"
+        # IPC -> CPC 변경, data 내부에서 특허 클래스 지칭하는 용어를 pc로 변경
+        if self.class_system == "CPC":
+            name_main_class, name_sub_class = "main_cpc", "sub_cpc"
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_cpc', 'sub_cpc', 'claims'])[['patent_number','main_cpc','sub_cpc','claims']]
+        elif self.class_system == "IPC":
+            name_main_class, name_sub_class = "main_ipc", "sub_ipc"
+            rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_ipc', 'sub_ipc', 'claims'])[['patent_number','main_ipc','sub_ipc','claims']]
+            
+        if len(rawdata_dropna) == 0 and self.config.data_nrows is not None:
+            print("No row in rawdata has ipc -> reload rawdata")
+            while len(rawdata_dropna) == 0:
+                self.rawdata = pd.read_csv(os.path.join(self.config.data_dir, self.config.data_file), low_memory=False, skiprows=lambda idx: idx != 0 and np.random.random() > 0.01)
+                rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_ipc', 'sub_ipc', 'claims'])[['patent_number','main_ipc','sub_ipc','claims']]
+            
+        main_pcs = [x for x in pd.unique(rawdata_dropna[name_main_class])]        
+        assert len(main_pcs) != 0, "target patent class is not observed"
 
         if self.data_type == "class" or self.data_type in ["class+claim", "claim+class"]:
-            data = rawdata_dropna[["number"]].copy(deep=True)
-            assert self.ipc_level in [1,2,3,4], f"Not implemented for an IPC level {self.ipc_level}"
-            if self.ipc_level == 1: # Section-Subsection (e.g., "A61")
-                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:3])
-                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:3] for xx in x.split(";")])))
-            elif self.ipc_level == 2: # Section-Subsection-Class (e.g., "A61K")
-                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:4])
-                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:4] for xx in x.split(";")])))
-            elif self.ipc_level == 3: # Section-Subsection-Class-Main group (e.g., "A61K03")
-                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x.split("/")[0][:4]+"0"+x.split("/")[0][4:] if len(x.split("/")[0][4:])<2 else x.split("/")[0])
-                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx.split("/")[0][:4]+"0"+xx.split("/")[0][4:] if len(xx.split("/")[0][4:])<2 else xx.split("/")[0] for xx in x.split(";")])))
-            elif self.ipc_level == 4: # Section-Subsection-Class-Sub group (e.g., "A61K03/45")
-                data['main_ipc'] = rawdata_dropna['main_ipc'].apply(lambda x: x[:4]+"0"+x[4:] if len(x[4:].split("/")[0])<2 else x)
-                data['sub_ipc'] = rawdata_dropna['sub_ipc'].apply(lambda x: list(np.unique([xx[:4]+"0"+xx[4:] if len(xx[4:].split("/")[0])<2 else xx for xx in x.split(";")])))
-            data["ipcs"] = data.apply(lambda x: [x["main_ipc"]]+x["sub_ipc"], axis=1)
-            seq_len = data['sub_ipc'].apply(lambda x: len(x)).max() + 3 # SOS - main ipc - sub ipcs - EOS
+            data = rawdata_dropna[["patent_number"]].copy(deep=True)
+            assert self.class_level in [1,2,3,4], f"Not implemented for an PC level {self.class_level}"
+            
+            # for IPC, formatting
+            if self.class_system == "IPC":
+                rawdata_dropna.loc[:, name_main_class] = rawdata_dropna[name_main_class].apply(lambda x: ";".join([s.split()[0] for s in re.findall(r'"([^"]*)"', x)]))
+                rawdata_dropna.loc[:, name_sub_class] = rawdata_dropna[name_sub_class].apply(lambda x: ";".join([s.split()[0] for s in re.findall(r'"([^"]*)"', x)]))
+            
+            data["main_class"] = rawdata_dropna[name_main_class].apply(lambda x: [] if x is None else extract_class_level(x, self.class_level))
+            data["sub_class"] = rawdata_dropna[name_sub_class].apply(lambda x: [] if x is None else extract_class_level(x, self.class_level))
+            data["patent_classes"] = data.apply(lambda x: x["main_class"] + x["sub_class"], axis=1)
+
+            seq_len = 1 + data['main_class'].apply(lambda x: len(x)).max() + data['sub_class'].apply(lambda x: len(x)).max() + 1 # SOS - main ipc - sub ipcs - EOS
             self.max_seq_len_class = seq_len if self.max_seq_len_class < seq_len else self.max_seq_len_class
             if self.data_type in ["class+claim", "claim+class"]:
                 data["claims"] = rawdata_dropna.loc[data.index]["claims"]
         elif self.data_type == "claim":
-            data = rawdata_dropna.loc[rawdata_dropna['main_ipc'].isin(main_ipcs)]
+            data = rawdata_dropna.loc[rawdata_dropna[name_main_class].isin(main_pcs)]
 
         rawdata_tc = self.rawdata.loc[data.index]
 
@@ -108,7 +148,7 @@ class TechDataset(Dataset):
         data["TC"+str(self.n_TC)+"_digitized"] = pd.Series(np.digitize(data["TC"+str(self.n_TC)].values, bins=bins_criterion, right=True))
 
         ## Get patent class
-        patent_classes = data["main_ipc"].apply(lambda x: x[:self.class_level]).values
+        patent_classes = data["main_class"].apply(lambda x: x[0]).values
         label_encoder = LabelEncoder()
         label_encoder.fit(patent_classes)
         data["class"] = pd.Series(label_encoder.fit_transform(patent_classes))
@@ -118,11 +158,8 @@ class TechDataset(Dataset):
         elif self.pred_target == "citation":
             self.target_classes = ["Least_valuable", "Most_valuable"]
 
-        data.index = pd.Index(data["number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
-
-        # sampled_index = data[data["TC"+str(self.n_TC)+"_digitized"]==0].sample(n=40000, random_state=10).index.union(data[data["TC"+str(self.n_TC)+"_digitized"]==1].index)
-        #
-        # data = data.loc[sampled_index]
+        data.index = pd.Index(data["patent_number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
+#         data = data.set_index("patent_number", drop=False)
 
         return data
 
@@ -210,7 +247,7 @@ class TechDataset(Dataset):
 
     def make_io(self, val_main=10, val_sub=1):
         if self.data_type == "class":
-            X = self.data["ipcs"]
+            X = self.data["patent_classes"]
         elif self.data_type == "claim":
             claim_separator = "\n\n\n"
             if self.claim_level != -1:
@@ -218,7 +255,7 @@ class TechDataset(Dataset):
             else:
                 X = self.data["claims"]
         elif self.data_type in ["class+claim", "claim+class"]:
-            X_class = self.data["ipcs"]
+            X_class = self.data["patent_classes"]
             claim_separator = "\n\n\n"
             if self.claim_level != -1:
                 X_claim = self.data["claims"].apply(lambda x: "".join(x.split(claim_separator)[:self.claim_level]) if len(x.split(claim_separator))>=self.claim_level else x)
@@ -286,8 +323,8 @@ class TechDataset(Dataset):
         return out
 
 class PatentClassTokenizer():
-    def __init__(self, ipc_data, max_len=100):
-        self.ipcs = ipc_data["ipcs"].values
+    def __init__(self, pc_data, max_len=100):
+        self.pcs = pc_data["patent_classes"].values
         self.max_len = max_len
         self.sos_token = "<SOS>"
         self.pad_token = "<PAD>"
@@ -300,7 +337,7 @@ class PatentClassTokenizer():
         self.unk_id = self.vocab_w2i[self.unk_token]
 
     def set_vocabulary(self):
-        self.vocabulary = np.unique(np.concatenate(self.ipcs))
+        self.vocabulary = np.unique(np.concatenate(self.pcs))
         self.special_tokens = [self.sos_token, self.pad_token, self.eos_token, self.unk_token]
         self.vocab_w2i = {self.special_tokens[i]: i for i in range(len(self.special_tokens))}
         self.vocab_w2i.update({self.vocabulary[i]: len(self.special_tokens)+i for i in range(len(self.vocabulary))})

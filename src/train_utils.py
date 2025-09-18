@@ -16,10 +16,12 @@ import functools
 import operator
 import time
 import re
+import math
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from nltk.translate.bleu_score import sentence_bleu
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
@@ -33,7 +35,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from parallel import DataParallelModel, DataParallelCriterion
 
 from accelerate import Accelerator
-from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss
+from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss, classification_report
 
 from data import TechDataset, CVSampler
 from models import Transformer, VCLS2CLS
@@ -46,6 +48,8 @@ try:
 except:
     ON_IPYTHON = False
 
+model_dir = os.path.join(root_dir, "models")    
+    
 class EarlyStopping:
     def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt'):
         self.patience = patience
@@ -62,7 +66,7 @@ class EarlyStopping:
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(model, val_loss)
+            self.save_checkpoint(model, val_loss, self.path)
         elif score < self.best_score + self.delta:
             self.counter += 1
             print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
@@ -72,15 +76,15 @@ class EarlyStopping:
                 model = self.load_model(model)
         else:
             self.best_score = score
-            self.save_checkpoint(model, val_loss)
+            self.save_checkpoint(model, val_loss, self.path)
             self.counter = 0
 
         return model
 
-    def save_checkpoint(self, model, val_loss):
+    def save_checkpoint(self, model, val_loss, path):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...\n')
-        torch.save(model.state_dict(), self.path)
+        torch.save(model.state_dict(), path)
         self.val_loss_min = val_loss
 
     def load_model(self, model):
@@ -88,9 +92,19 @@ class EarlyStopping:
         saved_model.load_state_dict(torch.load(self.path))
         return saved_model
 
-class EarlyStopping_multi(EarlyStopping):
-    def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt', criteria=None, alternate_train_threshold=None):
-        super().__init__()
+# class EarlyStopping_multi(EarlyStopping):
+class EarlyStopping_multi:
+    def __init__(self, patience=10, verbose=True, delta=0, path='../models/checkpoint.ckpt', criteria=None, alternate_train_threshold=None, model_params={}):
+        print("ES, patience:",patience)
+#         super().__init__()
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.path = path
+        self.model_params = model_params
         self.best_scores = None
         self.alternate_train_threshold = alternate_train_threshold
         if delta is not None:
@@ -107,8 +121,8 @@ class EarlyStopping_multi(EarlyStopping):
 
     def __call__(self, model, val_losses={}, ep=None):
         scores = {k: -val_losses[k] for k in self.loss_types}
-
-        if self.alternate_train_threshold is not None and ep > self.alternate_train_threshold:
+        
+        if (self.alternate_train_threshold is not None and ep > self.alternate_train_threshold) | (self.alternate_train_threshold is None):
             print("alternate_train_threshold entered")
             self.change_criteria(["recon", "y"])
         else:
@@ -117,7 +131,7 @@ class EarlyStopping_multi(EarlyStopping):
         if self.best_scores is None:
             self.best_scores = scores
             self.deltas = {k: self.best_scores[k]*self.delta for k in self.loss_types}
-            self.save_checkpoint(model, val_losses)
+            self.save_checkpoint(model, val_losses, ep, self.path, show_loss=True)
         elif any([scores[k] < self.best_scores[k] + self.deltas[k] for k in self.criteria]):
             self.counter += 1
             print(f'EarlyStopping counter: {self.counter} out of {self.patience}\n')
@@ -128,20 +142,29 @@ class EarlyStopping_multi(EarlyStopping):
         else:
             self.best_scores = scores
             self.deltas = {k: self.best_scores[k]*self.delta for k in self.loss_types}
-            self.save_checkpoint(model, val_losses)
+            self.save_checkpoint(model, val_losses, ep, self.path, show_loss=True)
             self.counter = 0
-
+            
         return model
 
+    def load_model(self, model):
+        saved_model = copy.copy(model)
+        saved_model.load_state_dict(torch.load(self.path))
+        return saved_model
+    
     def change_criteria(self, criteria):
         self.criteria = criteria
-
-    def save_checkpoint(self, model, val_losses):
+        
+    def show_verbose(self, val_losses):
         if self.verbose:
             for criterion in self.criteria:
                 print(f'Validation loss[{criterion}] decreased ({self.val_losses_min[criterion]:.6f} --> {val_losses[criterion]:.6f})')
             print("\n")
-        torch.save(model.state_dict(), self.path)
+
+    def save_checkpoint(self, model, val_losses, ep, path, show_loss=False):
+        if self.verbose and show_loss:
+            self.show_verbose(val_losses)
+        torch.save(model.state_dict(), path)
         self.val_losses_min = val_losses
 
 def epoch_time(start, end):
@@ -180,14 +203,18 @@ def build_model(model_params={}, trial=None, tokenizers=None):
 
     return model
 
-def train_model(model, train_loader, val_loader, model_params={}, train_params={}, class_weights=None, trial=None):
+def train_model(model, train_loader, val_loader, model_params={}, train_params={}, class_weights=None, trial=None, model_config_name_prefix=""):
     device = model_params['device']
     writer = SummaryWriter(log_dir=os.path.join(train_params['root_dir'], "results", "TB_logs"))
     if train_params['use_accelerator']:
         accelerator = train_params['accelerator']
 
     if train_params["alternate_train"]:
-        alternate_train_threshold = train_params["max_epochs"] - max(40, int(train_params["max_epochs"] * 0.6))
+        if train_params["alternate_train_threshold"] is not None:
+            alternate_train_threshold = train_params["alternate_train_threshold"]
+        else:
+            alternate_train_threshold = min(math.floor(train_params["max_epochs"] * 0.4), 10)
+        print("alternate_train_threshold: {}".format(alternate_train_threshold))
     else: alternate_train_threshold = None
 
     ## Loss function and optimizers
@@ -225,17 +252,17 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
     ## Training
     if train_params['use_early_stopping']:
         if model_params["model_type"]!="enc-pred-dec":
-            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"))
+            early_stopping = EarlyStopping(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint.ckpt"), model_params=model_params)
         else:
-            early_stopping = EarlyStopping_multi(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint_"+train_params['model_config_name']+".ckpt"), alternate_train_threshold=alternate_train_threshold)
+            early_stopping = EarlyStopping_multi(patience=early_stop_patience, verbose=True, path=os.path.join(train_params['root_dir'], "models/ES_checkpoint.ckpt"), alternate_train_threshold=alternate_train_threshold, model_params=model_params)
 
     print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Before training")
 
     if model_params["pretrained_enc"]: model.module.freeze(module_name="claim_encoder")
 
-    for ep in range(max_epochs):
+    for ep in range(train_params["curr_ep"], max_epochs+1):
         epoch_start = time.time()
-        print(f"Epoch {ep+1}\n"+str("-"*25))
+        print("Epoch {} / {}\n".format(ep, train_params["max_epochs"])+str("-"*25))
 
         if model_params["model_type"]=="enc-pred-dec" and train_params["alternate_train"]:
             if ep > alternate_train_threshold:
@@ -260,10 +287,28 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         writer.add_scalar("Loss/val[recon]", val_loss["recon"], ep)
         writer.add_scalar("Loss/val[kld]", val_loss["kld"], ep)
         writer.add_scalar("Loss/val[y]", val_loss["y"], ep)
+        
+        train_params.update({"curr_ep": ep})
 
+        # 중간 저장, 2epoch마다
+        if ep % 2 == 0:
+            model_config_name = "" + model_config_name_prefix
+            key_components = {"data": ["class_level", "class_system", "max_seq_len_class", "max_seq_len_claim", "vocab_size"], "model": ["n_layers", "d_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs", "curr_ep"]}
+            model_config_name += "[{}]system".format(train_params["class_system"])
+            for component in key_components["model"]:
+                model_config_name += f"[{str(model_params[component])}]{component}"
+            for component in key_components["train"]:
+                model_config_name += f"[{str(train_params[component])}]{component}"
+            final_model_path = os.path.join(model_dir, f"[MODEL]{model_config_name}.ckpt")
+            
+            if model_params["model_type"]!="enc-pred-dec":
+                early_stopping.save_checkpoint(model, val_losses=val_loss["total"], ep=ep, path=final_model_path)
+            else:
+                early_stopping.save_checkpoint(model, val_losses=val_loss, ep=ep, path=final_model_path)
+                
         if train_params['use_early_stopping']:
             if model_params["model_type"]!="enc-pred-dec":
-                model = early_stopping(model, val_loss=val_loss["total"])
+                model = early_stopping(model, val_losses=val_loss["total"], ep=ep)
             else:
                 model = early_stopping(model, val_losses=val_loss, ep=ep)
             if early_stopping.early_stop:
@@ -274,9 +319,10 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         torch.cuda.empty_cache()
     writer.flush()
     writer.close()
-    return model
+    return (model, model_params, train_params)
 
 def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode='train', train_params={}, model_params={}, alternate_train_threshold=None):
+    tokenizer = model.module.tokenizers["class_dec"]
     device = train_params['device']
     clip_max_norm = 1
     if mode=="train":
@@ -284,7 +330,8 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0, "kld": 0}
 
         # Temporary
-        preds_y_container = []
+#         preds_y_container = []
+#         trues_y_container = []
 
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=train_params['learning_rate'])
 
@@ -299,21 +346,23 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], profile_memory=True, use_cuda=True) as prof:
                     with record_function("model_feedforward"):
                         outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=train_params["teach_force_ratio"]) # omit <eos> from target sequence
+                        if model_params["device"] == "cpu":
+                            outputs = [outputs] # for single device
                         outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # outputs_recon: n_gpus * (minibatch, n_dec_seq, n_dec_vocab)
                         outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                         outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
                         outputs_mu = [output["mu"] for output in outputs]
                         outputs_logvar = [output["logvar"] for output in outputs]
-                        # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
                         dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
             else:
                 outputs = model(batch_data["text_inputs"], batch_data["text_outputs"], teach_force_ratio=train_params["teach_force_ratio"]) # omit <eos> from target sequence
+                if model_params["device"] == "cpu":
+                    outputs = [outputs] # for single device
                 outputs_recon = [output["dec_outputs"].permute(0,2,1)[:,:,1:] for output in outputs] # change the order of class and dimension (N, d1, C) -> (N, C, d1) => outputs_recon: (batch_size, n_dec_vocab, n_dec_seq-1)
                 outputs_z = [output["z"] for output in outputs] # outputs_z: n_gpus * (minibatch, d_hidden)
                 outputs_y = [output["pred_outputs"] for output in outputs] # outputs_y: n_gpus * (minibatch, n_outputs)
                 outputs_mu = [output["mu"] for output in outputs]
                 outputs_logvar = [output["logvar"] for output in outputs]
-                # dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z}
                 dict_outputs = {"recon": outputs_recon, "y": outputs_y, "z": outputs_z, "mu": outputs_mu, "logvar": outputs_logvar}
 
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Forward pass")
@@ -326,8 +375,9 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
                 # Temporary
-                preds_y_container.append(np.concatenate([ppp.cpu().detach().numpy().argmax(-1) for ppp in preds_y]))
+#                 preds_y_container.append(np.concatenate([ppp.cpu().detach().numpy().argmax(-1) for ppp in preds_y]))
                 trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
+#                 trues_y_container.append(np.concatenate([trues_y.cpu().detach().numpy()]))
 
             if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
@@ -336,6 +386,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 if train_params["alternate_train"]:
                     if epoch > alternate_train_threshold:
                         loss = loss_y + loss_recon + loss_kld
+#                         loss = loss_y # update both decoder and predictor according to the only loss for prediction (loss_y)
                     else:
                         loss = loss_recon + loss_kld
                 else:
@@ -380,16 +431,32 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
 
         dict_epoch_losses = {key: value / (data_loader.batch_size * len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
 
-        # Temporary
-        preds_y_container = np.concatenate(preds_y_container)
-        preds_y_counts = (len(preds_y_container[preds_y_container==0]), len(preds_y_container[preds_y_container==1]))
-        print(f"Pred 0: {preds_y_counts[0]}, Pred 1: {preds_y_counts[1]}")
+#         preds_y_container = np.concatenate(preds_y_container)
+#         trues_y_container = np.concatenate(trues_y_container)
+#         preds_y_counts = (len(preds_y_container[preds_y_container==0]), len(preds_y_container[preds_y_container==1]))
+#         print("Predictive performance evaluation on VALIDATION_DATA\n"+classification_report(trues_y_container, preds_y_container))
 
+#         trues_class = pd.Series(tokenizer.decode_batch(trues_recon.cpu().detach().numpy()))
+#         preds_class = pd.Series(tokenizer.decode_batch(np.concatenate([ppp.argmax(1).cpu().detach().numpy() for ppp in preds_recon])))
+        
+#         trues_class = trues_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
+#         preds_class = preds_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
+
+#         temp_recon_df = pd.concat([trues_class, preds_class], axis=1)
+#         temp_recon_df.columns = ['Origin Classes', 'Generated Classes']
+    
+#         Jaccard_similarities = temp_recon_df.apply(lambda x: len(set(x["Origin Classes"]).intersection(set(x["Generated Classes"]))) / len(set(x["Origin Classes"]).union(set(x["Generated Classes"]))), axis=1)
+#         mean_Jaccard = np.round(np.mean(Jaccard_similarities.values),4)
+#         print("Generative performance evaluation on VALIDATION_DATA\n"+"avg. Jaccard similarity: {}".format(mean_Jaccard))
+    
         return dict_epoch_losses
 
     elif mode=="eval" or mode=="test":
         model.eval()
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0, "kld": 0}
+        
+        preds_y_container = []
+        trues_y_container = []
 
         with torch.no_grad():
             for step, batch_data in tqdm(enumerate(data_loader)):
@@ -422,7 +489,10 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     preds_logvar = torch.cat([t.to(device) for t in dict_outputs["logvar"]])
                 if "pred" in model_params["model_type"]:
                     preds_y = dict_outputs["y"]
+                    preds_y_container.append(np.concatenate([ppp.cpu().detach().numpy().argmax(-1) for ppp in preds_y]))
                     trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
+                    trues_y_container.append(np.concatenate([trues_y.cpu().detach().numpy()]))
+                    
 
                 if model_params["model_type"] == "enc-pred-dec":
                     loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
@@ -458,6 +528,25 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 loss /= data_loader.batch_size
 
         dict_epoch_losses = {key: value / (data_loader.batch_size * len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
+        
+        preds_y_container = np.concatenate(preds_y_container)
+        trues_y_container = np.concatenate(trues_y_container)
+        preds_y_counts = (len(preds_y_container[preds_y_container==0]), len(preds_y_container[preds_y_container==1]))
+        print("Predictive performance evaluation on VALIDATION_DATA\n"+classification_report(trues_y_container, preds_y_container))
+
+        trues_class = pd.Series(tokenizer.decode_batch(trues_recon.cpu().detach().numpy()))
+        preds_class = pd.Series(tokenizer.decode_batch(np.concatenate([ppp.argmax(1).cpu().detach().numpy() for ppp in preds_recon])))
+        
+        trues_class = trues_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
+        preds_class = preds_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
+
+        temp_recon_df = pd.concat([trues_class, preds_class], axis=1)
+        temp_recon_df.columns = ['Origin Classes', 'Generated Classes']
+    
+        Jaccard_similarities = temp_recon_df.apply(lambda x: len(set(x["Origin Classes"]).intersection(set(x["Generated Classes"]))) / len(set(x["Origin Classes"]).union(set(x["Generated Classes"]))), axis=1)
+        mean_Jaccard = np.round(np.mean(Jaccard_similarities.values),4)
+        print("Generative performance evaluation on VALIDATION_DATA\n"+"avg. Jaccard similarity: {}".format(mean_Jaccard))
+
 
         return dict_epoch_losses
 
@@ -465,66 +554,74 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         print("mode is not specified")
         return
 
-def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params={}, train_params={}):
+# def validate_model_mp(model, val_dataset, mp=None, batch_size=None, model_params={}, train_params={}):
+def validate_model_mp(model_ckpt, val_dataset, mp=None, batch_size=None, model_params={}, train_params={}, tokenizers={}, use_gpu=False, n_cores=4):
     if batch_size is None:
         batch_size = train_params["batch_size"]
     queue_dataloader = mp.Queue()
     manager = mp.Manager()
-    ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in [device_id.index for device_id in train_params["device_ids"]]})
     processes = []
 
-    chunks = list(torch.arange(len(val_dataset)).chunk(len(train_params["device_ids"])))
-    for device_id, idx_chunk in zip(train_params["device_ids"], chunks):
+    if use_gpu:
+        device_list = train_params["device_ids"]
+    else:
+        device_list = [torch.device(type="cpu", index=i) for i in np.arange(n_cores)]
+    n_devices = len(device_list)
+    
+#     ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in [device_id.index for device_id in train_params["device_ids"]]})
+    ret_dict = manager.dict({d: manager.dict({"recon": manager.dict(), "y": manager.dict()}) for d in [device_id.index for device_id in device_list]})
+       
+    chunks = list(torch.arange(len(val_dataset)).chunk(n_devices))
+    for device_id, idx_chunk in zip(device_list, chunks):
         p = mp.Process(
             name="Subprocess",
             target=inference_mp,
-            args=(model.module, device_id.index, val_dataset, idx_chunk, ret_dict, model_params, batch_size)
+            args=(model_ckpt, device_id.index, val_dataset, idx_chunk, ret_dict, model_params, batch_size, tokenizers, use_gpu)
         )
         p.start()
         processes.append(p)
-
-
-    # for rank in range(train_params["device_ids"]):
-    #     # queue_dataloader.put(data_loaders[rank])
-        
-    #     indices = torch.arange(len(val_dataset)).chunk(train_params["device_ids"])[rank]
-    #     queue_dataloader.put((indices, batch_size))
-
-    # for device_id in train_params["device_ids"]:
-    #     device_rank = device_id.index
-    #     # model_rank = copy.deepcopy(model.module)
-    #     model_rank = model.module
-    #     p = mp.Process(name="Subprocess", target=inference_mp, args=(model_rank, device_rank, val_dataset, queue_dataloader, ret_dict, model_params, train_params))
-    #     p.start()
-    #     processes.append(p)
-
-    # data_loaders = [DataLoader(Subset(val_dataset, idx), batch_size=batch_size, num_workers=0) for idx in torch.arange(len(val_dataset)).chunk(train_params["n_gpus"])]
-
-    # for rank in range(train_params["device_ids"]):
-    #     # queue_dataloader.put(data_loaders[rank])
-        
-    #     indices = torch.arange(len(val_dataset)).chunk(train_params["device_ids"])[rank]
-    #     queue_dataloader.put((indices, batch_size))
 
     for p in processes:
         p.join()
 
     return ret_dict
 
-def inference_mp(model, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size):
+# def inference_mp(model, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size):
+def inference_mp(model_ckpt, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size, tokenizers, use_gpu):
     import torch
     import numpy as np
     from tqdm import tqdm
-    curr_device = torch.device(f"cuda:{device_rank}")
+    
+    root_device = torch.device("cuda") if use_gpu else torch.device("cpu")
+    curr_device = torch.device(f"cuda:{device_rank}") if use_gpu else torch.device(f"cpu:{device_rank}")
+
+    if not hasattr(tokenizers["claim_enc"], "vocab_size"):
+        tokenizers["claim_enc"].vocab_size = tokenizers["claim_enc"].get_vocab_size()
+    
+    # 모델 로드
+    model = VCLS2CLS(model_params, tokenizers=tokenizers)
+    if os.path.exists(model_ckpt):
+        best_states = torch.load(model_ckpt, map_location=root_device)
+    else:
+        raise Exception("Model need to be trained first")
+        
+    has_module_prefix = any(k.startswith("module.") for k in best_states.keys())
+    if has_module_prefix:
+        stripped = {}
+        for k, v in best_states.items():
+            new_key = k[len("module."):] if k.startswith("module.") else k
+            stripped[new_key] = v
+        best_states = stripped       
+    
+    model.load_state_dict(best_states)
     model = model.to(device=curr_device)
     model.device = curr_device
+    model.eval()
+    
     with torch.no_grad():
         try:
-            # indices, batch_size = queue_dataloader.get()
-            # print(type(indices), type(batch_size))
             subset = Subset(val_dataset, idx_chunk)
             data_loader = DataLoader(subset, batch_size=batch_size, num_workers=0, pin_memory=False)
-            # print(type(data_loader))
         except TimeoutError:
             print(f"[Rank {device_rank}] queue is empty after timeout")
             return
@@ -547,13 +644,10 @@ def inference_mp(model, device_rank, val_dataset, idx_chunk, ret_dict, model_par
             trues_y.append(batch_data["targets"].cpu().detach().numpy())
 
             enc_outputs, z, mu, logvar = model.encode(batch_data["text_inputs"])
-            # enc_outputs, z = model.encode(batch_data["text_inputs"])
 
             if "pred" in model_params["model_type"]:
                 preds_y_batch = model.predict(z)
                 if len(preds_y_batch.size()) > 2 and preds_y_batch.size(1) == 1: preds_y_batch = preds_y_batch.squeeze(0)
-                # print(z.shape)
-                # preds_y_batch = model.predictor(enc_outputs) # pred_outputs: (batch_size, n_outputs)
                 preds_y.append(preds_y_batch.cpu().detach().numpy())
 
             if "dec" in model_params["model_type"]:
@@ -642,13 +736,13 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         if recon_kw is not None:
             trues_claims_kw = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
             eval_res = pd.concat([trues_claims_kw, trues_class, preds_class, BLEU_scores], axis=1)
-            eval_res.columns = ['Origin claims (keywords)', 'Origin IPCs', 'Generated IPCs', "BLEU Score"]
-            Jaccard_similarities = eval_res.apply(lambda x: len(set(x["Origin IPCs"]).intersection(set(x["Generated IPCs"]))) / len(set(x["Origin IPCs"]).union(set(x["Generated IPCs"]))), axis=1)
+            eval_res.columns = ['Origin claims (keywords)', 'Origin Classes', 'Generated Classes', "BLEU Score"]
+            Jaccard_similarities = eval_res.apply(lambda x: len(set(x["Origin Classes"]).intersection(set(x["Generated Classes"]))) / len(set(x["Origin Classes"]).union(set(x["Generated Classes"]))), axis=1)
             eval_res.loc[:,"Jaccard Similarity"] = Jaccard_similarities
             eval_res.loc[len(eval_res)] = ["", "", "Average", np.round(np.mean(BLEU_scores.values),4), np.round(np.mean(Jaccard_similarities.values),4)]
         else:
             eval_res = pd.concat([trues_claims, preds_claims, BLEU_scores], axis=1)
-            eval_res.columns = ['Origin IPCs', 'Origin claims', 'Generated IPCs', "BLEU Score"]
+            eval_res.columns = ['Origin Classes', 'Origin claims', 'Generated Classes', "BLEU Score"]
             eval_res.loc[len(eval_res)] = ["", "", "Average BLEU Score", np.round(np.mean(BLEU_scores.values),4)]
 
         return eval_res

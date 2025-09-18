@@ -510,7 +510,7 @@ class VCLS2CLS(nn.Module):
 
         next_input = torch.tensor(np.tile([self.tokenizers["class_enc"].vocab_w2i["<SOS>"]], batch_size), device=device) # (batch_size)
 
-        dec_outputs = torch.zeros((batch_size, self.n_dec_seq_class, self.tokenizers["class_dec"].vocab_size), device=device) # (batch_size, vocab_size, seq_len)
+        dec_outputs = torch.zeros((batch_size, self.n_dec_seq_class, self.tokenizers["class_dec"].get_vocab_size()), device=device) # (batch_size, vocab_size, seq_len)
 
         for t in range(1, self.n_dec_seq_class):
             output, next_hidden, pred_token = self.pred_next(next_input, next_hidden, enc_outputs)
@@ -612,7 +612,7 @@ class Encoder_Transformer(nn.Module):
         self.tokenizer = tokenizer
         # self.d_hidden =  self.d_hidden
 
-        self.enc_emb = nn.Embedding(self.tokenizer.vocab_size, self.d_hidden)
+        self.enc_emb = nn.Embedding(self.tokenizer.get_vocab_size(), self.d_hidden)
         sinusoid_table = torch.tensor(get_sinusoid_encoding_table(self.n_enc_seq_claim + 1, self.d_hidden), dtype=torch.float32)
         self.pos_emb = nn.Embedding.from_pretrained(sinusoid_table, freeze=True)
 
@@ -651,7 +651,7 @@ class Encoder_SEQ(nn.Module):
         # self.d_hidden =  self.config.d_enc_hidden * self.config.n_directions
 
         self.gru = nn.GRU(self.d_embedding, self.d_hidden, self.n_layers, batch_first=True, bidirectional=self.bidirec).to(self.device)
-        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding, padding_idx=self.i_padding).to(self.device)
+        self.embedding = nn.Embedding(self.tokenizer.get_vocab_size(), self.d_embedding, padding_idx=self.i_padding).to(self.device)
         self.dropout = nn.Dropout(self.p_dropout).to(self.device)
         # self.fc = nn.Linear(self.d_hidden, self.config.d_enc_hidden).to(self.device)
 
@@ -686,10 +686,10 @@ class Decoder_SEQ(nn.Module):
         if tokenizer is not None:
             self.tokenizer = tokenizer
 
-        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding)
+        self.embedding = nn.Embedding(self.tokenizer.get_vocab_size(), self.d_embedding)
         self.dropout = nn.Dropout(self.p_dropout)
         self.gru = nn.GRU(self.d_embedding, self.d_hidden, self.n_layers, batch_first=True, bidirectional=self.bidirec)
-        self.fc_out = nn.Linear(self.d_hidden * self.n_directions, self.tokenizer.vocab_size)
+        self.fc_out = nn.Linear(self.d_hidden * self.n_directions, self.tokenizer.get_vocab_size())
 
     def forward(self, inputs, hidden=None):
         inputs = inputs.unsqueeze(1)
@@ -746,9 +746,9 @@ class AttnDecoder_SEQ(nn.Module):
             self.tokenizer = tokenizer
 
         self.attention = Attention(config=self.config)
-        self.embedding = nn.Embedding(self.tokenizer.vocab_size, self.d_embedding).to(self.device)
+        self.embedding = nn.Embedding(self.tokenizer.get_vocab_size(), self.d_embedding).to(self.device)
         self.gru = nn.GRU((self.d_hidden * self.n_directions) + self.d_embedding, self.d_hidden, self.n_layers, bidirectional=self.bidirec, batch_first=True).to(self.device)
-        self.fc_out = nn.Linear(self.d_embedding + (self.d_hidden * self.n_directions) + (self.d_hidden * self.n_directions), self.tokenizer.vocab_size)
+        self.fc_out = nn.Linear(self.d_embedding + (self.d_hidden * self.n_directions) + (self.d_hidden * self.n_directions), self.tokenizer.get_vocab_size())
         self.dropout = nn.Dropout(self.p_dropout).to(self.device)
 
     def forward(self, inputs, hidden, enc_outputs):
