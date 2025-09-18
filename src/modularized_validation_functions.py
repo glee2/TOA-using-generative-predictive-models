@@ -1,3 +1,10 @@
+# Notes
+'''
+Author: Gyumin Lee
+Version: 2.0
+Description (primary changes): Code refactoring
+'''
+
 import torch
 import numpy as np
 import copy

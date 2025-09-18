@@ -1,13 +1,13 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.3
-Description (primary changes): Claim + class -> class
+Version: 2.0
+Description (primary changes): Code refactoring
 '''
 
 # Set root directory
 root_dir = '/home2/glee/dissertation/1_tech_gen_impact/class2class/Tech_Gen/'
-master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
+# master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
@@ -108,8 +108,8 @@ if __name__=="__main__":
     current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
 
     ''' PART 1: Configuration '''
-    project_data_dir = os.path.join(master_dir, "data")
-    data_dir = os.path.join("/home2/glee/patent_data/data/")
+    project_data_dir = os.path.join(root_dir, "data", "project_data")
+    data_dir = os.path.join(root_dir, "data", "patent_data")
     model_dir = os.path.join(root_dir, "models")
     result_dir = os.path.join(root_dir, "results")
     config_dir = os.path.join(root_dir, "configs")

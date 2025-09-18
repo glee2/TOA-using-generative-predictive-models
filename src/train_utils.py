@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.31
-Description (primary changes): Early stopping for each criterion
+Version: 2.0
+Description (primary changes): Code refactoring
 '''
 
 # Set root directory

@@ -1,8 +1,8 @@
 # Notes
 '''
 Author: Gyumin Lee
-Version: 1.2
-Description (primary changes): Claim + class -> class
+Version: 2.0
+Description (primary changes): Code refactoring
 '''
 
 # Set root directory
