@@ -12,23 +12,15 @@ sys.path.append(root_dir)
 
 # Basic libraries
 import os
-import copy
 import re
-import time
-import datetime
 import pandas as pd
 import numpy as np
-from functools import partial
 
 # DL libraries
 import torch
 from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
-import torchvision.datasets
-import sklearn
-from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold, ShuffleSplit, KFold
-from sklearn.datasets import load_digits
 from sklearn.preprocessing import LabelEncoder
 from tokenizers import Tokenizer, normalizers, decoders
 from tokenizers.models import BPE, WordPiece
@@ -40,10 +32,7 @@ from transformers import DistilBertTokenizer
 from transformers import T5Tokenizer
 
 # Text cleaning libraries
-import nltk
 from nltk.corpus import stopwords
-from nltk.stem.porter import PorterStemmer
-import cleantext
 from cleantext.sklearn import CleanTransformer
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -84,8 +73,19 @@ class TechDataset(Dataset):
         for key, value in config.items():
             setattr(self, key, value)
 
-        self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file), low_memory=False, nrows=self.data_nrows)
+        try:
+            self.rawdata = pd.read_csv(os.path.join(config.data_dir, config.data_file), low_memory=False, nrows=self.data_nrows)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File not found: {os.path.join(config.data_dir, config.data_file)}")
+        except pd.errors.EmptyDataError:
+            raise ValueError(f"The file at {os.path.join(config.data_dir, config.data_file)} is empty or invalid.")
         self.target_classes = None
+
+        # Validate required columns in rawdata
+        required_columns = ['main_cpc', 'sub_cpc', 'claims', 'patent_number']
+        missing_columns = [col for col in required_columns if col not in self.rawdata.columns]
+        if missing_columns:
+            raise ValueError(f"The following required columns are missing in the rawdata: {missing_columns}")
         self.data = self.preprocess()
         self.tokenizers = self.get_tokenizers()
         self.original_idx = np.array(self.data.index)
@@ -294,6 +294,8 @@ class TechDataset(Dataset):
 
     def __getitem__(self, idx):
         target_dtype = torch.long if self.pred_type=="classification" else torch.float32
+        if self.Y is None or len(self.Y) == 0:
+            raise ValueError("The target variable 'self.Y' is not initialized or is empty.")
         target_outputs = torch.tensor(self.Y[idx], dtype=target_dtype)
 
         if self.data_type == "class":
