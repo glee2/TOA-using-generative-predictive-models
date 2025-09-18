@@ -37,7 +37,6 @@ def to_device(x, device):
             else:
                 out[k] = v.to(device)
         return out
-        # return {k: to_device(v, device) for k,v in x.items() if isinstance(v, dict) else k: v.to(device)}
     elif isinstance(x, torch.Tensor):
         return x.to(device)
 
@@ -62,7 +61,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float("Inf")
     """
     assert (
         logits.dim() == 1
-    )  # batch size 1 for now - could be updated for more but the code would be less clear
+    )
     top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
         # Remove all tokens with a probability less than the last token of the top-k

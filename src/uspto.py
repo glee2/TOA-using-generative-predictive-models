@@ -13,16 +13,16 @@ def makedirs(path):
 
 def search(q, save_path=None, databases=["US-PGPUB", "USPAT", "USOCR"], pageCount=1000, keys=[], n_limit=None, start_index=0, verbose=False):
     """
-    검색 쿼리의 결과로 나온 특허들의 식별자를 반환함.
+    Returns identifiers of patents from search query results.
 
-    q: 검색 쿼리 (USPTO 사이트에서처럼 동일하게 사용하면 됨)
-    save_path: 검색 결과 저장 경로
-    databases: 검색할 데이터베이스, 복수 가능
-        - "US-PGPUB": 출원신청 특허
-        - "USPAT": 등록 특허
-        - "USOCR": OCR 시스템으로 읽은 옛날 특허 포함
-    pageCount: 한번에 return 받을 검색결과 수
-    keys: 추가로 받을 필드들
+    q: search query (use exactly as on the USPTO site)
+    save_path: path to save search results
+    databases: databases to search, multiple possible
+        - "US-PGPUB": patent applications
+        - "USPAT": registered patents
+        - "USOCR": includes old patents read by OCR systems
+    pageCount: number of search results to return at once
+    keys: additional fields to receive
     """
     url = "https://ppubs.uspto.gov/dirsearch-public/searches/searchWithBeFamily"
 

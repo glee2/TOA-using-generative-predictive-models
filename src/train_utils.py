@@ -290,7 +290,7 @@ def train_model(model, train_loader, val_loader, model_params={}, train_params={
         
         train_params.update({"curr_ep": ep})
 
-        # 중간 저장, 2epoch마다
+        # Intermediate save, every 2 epochs
         if ep % 2 == 0:
             model_config_name = "" + model_config_name_prefix
             key_components = {"data": ["class_level", "class_system", "max_seq_len_class", "max_seq_len_claim", "vocab_size"], "model": ["n_layers", "d_hidden", "d_pred_hidden", "d_latent", "d_embedding", "d_ff", "n_head", "d_head"], "train": ["learning_rate", "batch_size", "max_epochs", "curr_ep"]}

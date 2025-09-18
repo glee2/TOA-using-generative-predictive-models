@@ -38,12 +38,12 @@ from cleantext.sklearn import CleanTransformer
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 extract_class_pattern = re.compile(
-    r'([A-Za-z])'      # 1) 첫글자
-    r'(\d{2})'         # 2) 두 자리 숫자
-    r'([A-Za-z])'      # 3) 두 번째 문자
-    r'(\d{0,3})'       # 4) pre-슬래시 숫자 (1~3자리)
+    r'([A-Za-z])'      # 1) First character
+    r'(\d{2})'         # 2) Two-digit number
+    r'([A-Za-z])'      # 3) Second character
+    r'(\d{0,3})'       # 4) Pre-slash number (1~3 digits)
     r'/'
-    r'(\d{0,6})'       # 5) post-슬래시 숫자 (1~6자리)
+    r'(\d{0,6})'       # 5) Post-slash number (1~6 digits)
 )
 
 def extract_class_level(code, level):
@@ -100,7 +100,7 @@ class TechDataset(Dataset):
         latest_year = 2022
         cols_year = ['<1976']+list(np.arange(1976,latest_year).astype(str))
 
-        # IPC -> CPC 변경, data 내부에서 특허 클래스 지칭하는 용어를 pc로 변경
+        # Change IPC -> CPC, change the term that refers to patent class in data to pc
         if self.class_system == "CPC":
             name_main_class, name_sub_class = "main_cpc", "sub_cpc"
             rawdata_dropna = self.rawdata.dropna(axis=0, subset=['main_cpc', 'sub_cpc', 'claims'])[['patent_number','main_cpc','sub_cpc','claims']]
@@ -159,7 +159,6 @@ class TechDataset(Dataset):
             self.target_classes = ["Least_valuable", "Most_valuable"]
 
         data.index = pd.Index(data["patent_number"].apply(lambda x: str(x) if not isinstance(x, str) else x))
-#         data = data.set_index("patent_number", drop=False)
 
         return data
 

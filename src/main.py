@@ -7,16 +7,14 @@ Description (primary changes): Code refactoring
 
 # Set root directory
 root_dir = '/home2/glee/dissertation/1_tech_gen_impact/class2class/Tech_Gen/'
-# master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
+master_dir = '/home2/glee/dissertation/1_tech_gen_impact/master/Tech_Gen/'
 import sys
 sys.path.append(root_dir)
 
 import copy
-import gc
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import argparse
-import math
 import time
 import pickle
 import re
@@ -27,9 +25,6 @@ import warnings
 warnings.filterwarnings(action='ignore', category=UserWarning)
 warnings.filterwarnings(action='ignore', category=DeprecationWarning)
 sys.path.append("/share/tml_package")
-from tml import utils
-from scipy import io
-from tqdm import tqdm
 from collections import OrderedDict
 
 import torch
@@ -37,11 +32,9 @@ from torch.nn import functional as F
 from torch.nn import DataParallel as DP
 from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from accelerate import Accelerator
-import pytorch_model_summary
 
 import optuna
-from optuna.samplers import RandomSampler, TPESampler
-from optuna.integration import SkoptSampler
+from optuna.samplers import TPESampler
 
 import numpy as np
 import pandas as pd
@@ -108,8 +101,8 @@ if __name__=="__main__":
     current_datetime = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
 
     ''' PART 1: Configuration '''
-    project_data_dir = os.path.join(root_dir, "data", "project_data")
-    data_dir = os.path.join(root_dir, "data", "patent_data")
+    project_data_dir = os.path.join(master_dir, "data")
+    data_dir = os.path.join("/home2/glee/patent_data/data/")
     model_dir = os.path.join(root_dir, "models")
     result_dir = os.path.join(root_dir, "results")
     config_dir = os.path.join(root_dir, "configs")
@@ -133,7 +126,7 @@ if __name__=="__main__":
         print("Analysis datetime: {}".format(current_datetime))
         analysis_date = current_datetime
     
-    # parse command line arguments
+    ## parse command line arguments
     instant_configs = {key: value for (key, value) in vars(args).items() if value is not None} # if any argument passed when main.py executed
     instant_configs_for_update = {configkey: {key: value for (key,value) in instant_configs.items() if key in org_config_keys[configkey]} for configkey in org_config_keys.keys()}
     for key, value in configs.items():
@@ -223,8 +216,6 @@ if __name__=="__main__":
             for component in key_components[key]:
                 model_config_name += f"[{str(configs[key][component])}]{component}"
         final_model_path = os.path.join(model_dir, f"[MODEL]{model_config_name}.ckpt")
-
-#     configs.train.update({"model_config_name": model_config_name, "final_model_path": final_model_path})
 
     ''' PART 2: Dataset setting '''
     tstart = time.time()
@@ -439,7 +430,6 @@ if __name__=="__main__":
 
         ## Evaluation on test dataset
         print("Validate model on test dataset")
-#         val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train)
         val_res_test = validate_model_mp(final_model_path, test_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train, tokenizers=tech_dataset.tokenizers, use_gpu=args.use_gpu, n_cores=configs.train.n_cores)
         if "pred" in configs.model.model_type:
             trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])
@@ -519,7 +509,6 @@ if __name__=="__main__":
             if args.eval_train_set:
                 ## Evaluation on train dataset
                 print("Validate model on train dataset")
-#                 val_res_train = validate_model_mp(final_model, train_dataset, mp=mp, model_params=configs.model, train_params=configs.train)
                 val_res_train = validate_model_mp(final_model_path, train_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train, tokenizers=tech_dataset.tokenizers, use_gpu=False, n_cores=configs.train.n_cores)
                 if "pred" in configs.model.model_type:
                     trues_y_train = np.concatenate([res["y"]["true"] for res in val_res_train.values()])
@@ -542,7 +531,6 @@ if __name__=="__main__":
 
             ## Evaluation on test dataset
             print("Validate model on test dataset")
-#             val_res_test = validate_model_mp(final_model, test_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train)
             val_res_test = validate_model_mp(final_model_path, test_dataset, mp=mp, batch_size=4, model_params=configs.model, train_params=configs.train, tokenizers=tech_dataset.tokenizers, use_gpu=False, n_cores=configs.train.n_cores)
             if "pred" in configs.model.model_type:
                 trues_y_test = np.concatenate([res["y"]["true"] for res in val_res_test.values()])

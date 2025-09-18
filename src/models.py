@@ -11,8 +11,6 @@ import sys
 sys.path.append(root_dir)
 
 # Basic libraries
-import os
-import copy
 import pandas as pd
 import numpy as np
 
@@ -21,8 +19,6 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.autograd import Variable
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from transformers import DistilBertModel
 from transformers import T5ForConditionalGeneration, T5Config
 
