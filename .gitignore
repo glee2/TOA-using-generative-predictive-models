@@ -6,8 +6,6 @@ src/runs/
 .ipynb_checkpoints/
 results/*
 !results/.keep
-data/
+data/*
 !data/.keep
-data/validation_out*
-data/*.pickle
 backup/
