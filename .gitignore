@@ -8,4 +8,6 @@ results/*
 !results/.keep
 data/
 !data/.keep
+data/validation_out*
+data/*.pickle
 backup/
