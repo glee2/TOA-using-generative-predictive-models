@@ -1,18 +1,3 @@
-glee2: 본 연구 프로젝트에 대한 Github repository의 README.md (마크다운 문서)를 작성해줘.
-내 연구의 repository는 (glee2/TOA-using-generative-predictive-models)이고, 연구 논문은 Revised manuscript (20250903).pdf야.
-논문 내용과 repository 내 코드 구성을 바탕으로 README.md에 들어갈 내용을 정리하고, 일반적인 Github repository README.md 형식에 맞게 작성해줘.
-README.md에는 다음 내용이 포함되어야 해.
-▪ 논문 제목 및 링크.
-▪ 프로젝트 개요 및 목적.
-▪ 설치 및 환경 설정 방법.
-▪ 데이터 다운로드 및 전처리 방법.
-▪ 모델 학습 및 평가 방법.
-▪ 기술 기회 탐색 및 결과 재현 방법.
-▪ 코드 사용 및 인용 방법에 대한 가이드라인.
-각 부분에 필요한 figure를 명시해주고, 모두 영문으로 작성해줘.
-
-Workspace: 작업 영역 정보 수집# Technological Impact-Guided Technology Opportunity Analysis Using a Generative-Predictive Machine Learning Model
-
 [![Paper](https://img.shields.io/badge/Paper-PDF-red)](https://link-to-your-paper.pdf)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
