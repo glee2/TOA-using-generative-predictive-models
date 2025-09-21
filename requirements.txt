@@ -1,0 +1,21 @@
+# Core training and evaluation stack
+accelerate
+cleantext
+multiprocess
+nltk
+numpy
+optuna
+pandas
+requests
+scikit-learn
+scipy
+sentencepiece
+tensorboard
+tokenizers
+torch
+tqdm
+transformers
+
+# Data preparation & notebook utilities
+polars
+pyarrow
