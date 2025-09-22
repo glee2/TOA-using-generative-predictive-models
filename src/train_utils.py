@@ -12,8 +12,6 @@ sys.path.append(root_dir)
 
 import os
 import copy
-import functools
-import operator
 import time
 import re
 import math
@@ -25,9 +23,8 @@ from collections import OrderedDict
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.nn import functional as F
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from torch.profiler import profile, record_function, ProfilerActivity
 
@@ -35,11 +32,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 from parallel import DataParallelModel, DataParallelCriterion
 
 from accelerate import Accelerator
-from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, log_loss, classification_report
+from sklearn.metrics import confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, classification_report
 
-from data import TechDataset, CVSampler
 from models import VCLS2CLS
-from utils import token2class, print_gpu_memcheck, to_device, loss_KLD, KLDLoss
+from utils import print_gpu_memcheck, to_device, loss_KLD, KLDLoss
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 ON_IPYTHON = True
@@ -198,7 +194,6 @@ def build_model(model_params={}, trial=None, tokenizers=None):
         model = torch.compile(model)
 
     if len(device_ids) > 1 and not model_params['use_accelerator']:
-        # model = torch.nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[1])
         model = DataParallelModel(model, device_ids=device_ids)
 
     return model
@@ -329,15 +324,10 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
         model.train()
         dict_epoch_losses = {"total": 0, "recon": 0, "y": 0, "kld": 0}
 
-        # Temporary
-#         preds_y_container = []
-#         trues_y_container = []
-
         optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=train_params['learning_rate'])
 
         for step, batch_data in tqdm(enumerate(data_loader)):
             torch.cuda.empty_cache()
-            # batch_data = to_device(batch_data, device)
             print_gpu_memcheck(verbose=train_params['mem_verbose'], devices=train_params['device_ids'], stage="Load data")
 
             optimizer.zero_grad()
@@ -374,10 +364,7 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 preds_logvar = torch.cat([t.to(device) for t in dict_outputs["logvar"]])
             if "pred" in model_params["model_type"]:
                 preds_y = dict_outputs["y"]
-                # Temporary
-#                 preds_y_container.append(np.concatenate([ppp.cpu().detach().numpy().argmax(-1) for ppp in preds_y]))
                 trues_y = batch_data["targets"].to(dtype=preds_y[0].dtype) if model_params["n_outputs"]==1 else batch_data["targets"]
-#                 trues_y_container.append(np.concatenate([trues_y.cpu().detach().numpy()]))
 
             if model_params["model_type"] == "enc-pred-dec":
                 loss_recon = train_params["loss_weights"]["recon"] * loss_f["recon"](preds_recon, trues_recon)
@@ -386,7 +373,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                 if train_params["alternate_train"]:
                     if epoch > alternate_train_threshold:
                         loss = loss_y + loss_recon + loss_kld
-#                         loss = loss_y # update both decoder and predictor according to the only loss for prediction (loss_y)
                     else:
                         loss = loss_recon + loss_kld
                 else:
@@ -430,24 +416,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
             print(prof.key_averages().table(sort_by='cpu_time_total', row_limit=10))
 
         dict_epoch_losses = {key: value / (data_loader.batch_size * len(data_loader)) for key, value in dict_epoch_losses.items()} # Averaging
-
-#         preds_y_container = np.concatenate(preds_y_container)
-#         trues_y_container = np.concatenate(trues_y_container)
-#         preds_y_counts = (len(preds_y_container[preds_y_container==0]), len(preds_y_container[preds_y_container==1]))
-#         print("Predictive performance evaluation on VALIDATION_DATA\n"+classification_report(trues_y_container, preds_y_container))
-
-#         trues_class = pd.Series(tokenizer.decode_batch(trues_recon.cpu().detach().numpy()))
-#         preds_class = pd.Series(tokenizer.decode_batch(np.concatenate([ppp.argmax(1).cpu().detach().numpy() for ppp in preds_recon])))
-        
-#         trues_class = trues_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
-#         preds_class = preds_class.apply(lambda x: x[:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x)
-
-#         temp_recon_df = pd.concat([trues_class, preds_class], axis=1)
-#         temp_recon_df.columns = ['Origin Classes', 'Generated Classes']
-    
-#         Jaccard_similarities = temp_recon_df.apply(lambda x: len(set(x["Origin Classes"]).intersection(set(x["Generated Classes"]))) / len(set(x["Origin Classes"]).union(set(x["Generated Classes"]))), axis=1)
-#         mean_Jaccard = np.round(np.mean(Jaccard_similarities.values),4)
-#         print("Generative performance evaluation on VALIDATION_DATA\n"+"avg. Jaccard similarity: {}".format(mean_Jaccard))
     
         return dict_epoch_losses
 
@@ -521,7 +489,6 @@ def run_epoch(data_loader, model, epoch=None, loss_f=None, optimizer=None, mode=
                     dict_epoch_losses["recon"] += loss_recon.item()
                     dict_epoch_losses["kld"] += loss_kld.item()
 
-                # dict_epoch_losses["total"] += loss_recon.item() + loss_kld.item() + loss_y.item()
                 dict_epoch_losses["total"] += loss.item()
 
                 ## averaging (by batch_size)
@@ -586,7 +553,6 @@ def validate_model_mp(model_ckpt, val_dataset, mp=None, batch_size=None, model_p
 
     return ret_dict
 
-# def inference_mp(model, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size):
 def inference_mp(model_ckpt, device_rank, val_dataset, idx_chunk, ret_dict, model_params, batch_size, tokenizers, use_gpu):
     import torch
     import numpy as np
@@ -728,7 +694,6 @@ def perf_eval(model_name, trues, preds, recon_kw=None, configs=None, pred_type='
         assert configs is not None, "Configuration is needed to evaulate Generative model"
         assert tokenizer is not None, "Tokenizer is needed to convert ids to tokens"
 
-        ## Temporary -> TODO: make dictionary of claim and class
         trues_claims = pd.Series(configs.model.tokenizers["claim_dec"].decode_batch(recon_kw))
         trues_class = pd.Series(tokenizer.decode_batch(trues)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)])
         preds_class = pd.Series(tokenizer.decode_batch(preds)).apply(lambda x: x[x.index(tokenizer.sos_token)+1:x.index(tokenizer.eos_token)] if tokenizer.eos_token in x else x[x.index(tokenizer.sos_token)+1:])

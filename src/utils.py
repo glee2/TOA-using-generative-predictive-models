@@ -11,20 +11,13 @@ import sys
 sys.path.append(root_dir)
 
 # Basic libraries
-import os
-import copy
-import pandas as pd
 import numpy as np
 import json
 from collections.abc import Iterable
 
 # DL libraries
 import torch
-from torch import nn, optim
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
 from torch.nn.modules.loss import _Loss
-import sklearn
-from sklearn.metrics import confusion_matrix
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 

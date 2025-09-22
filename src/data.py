@@ -227,6 +227,7 @@ class TechDataset(Dataset):
             class_dec_tokenizer = class_enc_tokenizer
             tokenizers = {"claim_enc": claim_enc_tokenizer, "claim_dec": claim_dec_tokenizer, "class_enc": class_enc_tokenizer, "class_dec": class_dec_tokenizer}
 
+        # Return a dictionary containing the encoder and decoder tokenizers
         return tokenizers
 
     def extract_keywords(self, claims):

@@ -19,9 +19,7 @@ import torch
 from torch import nn, optim
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from transformers import DistilBertModel, T5Config, T5ForConditionalGeneration
-
-from utils import top_k_top_p_filtering
+from transformers import DistilBertModel
 
 ## weight initialization
 def init_weights(m):
@@ -548,42 +546,3 @@ class Attention(nn.Module):
         attention = self.v(energy).squeeze(2) # (batch_size, seq_len)
 
         return F.softmax(attention, dim=1)
-
-class AttnDecoder_SEQ(nn.Module):
-    def __init__(self, config={}, tokenizer=None):
-        super().__init__()
-        self.config = config
-        for key, value in config.items():
-            setattr(self, key, value)
-        if tokenizer is not None:
-            self.tokenizer = tokenizer
-
-        self.attention = Attention(config=self.config)
-        self.embedding = nn.Embedding(self.tokenizer.get_vocab_size(), self.d_embedding).to(self.device)
-        self.gru = nn.GRU((self.d_hidden * self.n_directions) + self.d_embedding, self.d_hidden, self.n_layers, bidirectional=self.bidirec, batch_first=True).to(self.device)
-        self.fc_out = nn.Linear(self.d_embedding + (self.d_hidden * self.n_directions) + (self.d_hidden * self.n_directions), self.tokenizer.get_vocab_size())
-        self.dropout = nn.Dropout(self.p_dropout).to(self.device)
-
-    def forward(self, inputs, hidden, enc_outputs):
-        # inputs: (batch_size), hidden: (n_layers, batch_size, hidden_dim * n_directions), encoder_outputs: (batch_size, seq_len, hidden_dim * n_directions)
-        inputs = inputs.unsqueeze(1) # (batch_size, 1)
-
-        embedded = self.dropout(self.embedding(inputs)) # (batch_size, 1, embedding_dim)
-
-        a = self.attention(hidden, enc_outputs)
-        a = a.unsqueeze(1) # (batch_size, 1, seq_len)
-
-        weighted = torch.bmm(a, enc_outputs) # (batch_size, 1, hidden_dim * n_directions)
-
-        gru_input = torch.cat((embedded, weighted), dim=2) # (batch_size, 1, hidden_dim * n_directions + embedding_dim)
-
-        output, hidden = self.gru(gru_input, hidden) # output: (batch_size, 1, hidden_dim * n_directions), hidden: (n_layers, batch_size, hidden_dim * n_directions)
-
-        embedded = embedded.squeeze(1)
-        weighted = weighted.squeeze(1)
-        output = output.squeeze(1)
-
-        prediction = self.fc_out(torch.cat((embedded, weighted, output), dim=1)) # (batch_size, vocab_size)
-        # prediction = self.log_softmax(prediction)
-
-        return prediction, hidden

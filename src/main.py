@@ -30,7 +30,7 @@ from collections import OrderedDict
 import torch
 from torch.nn import functional as F
 from torch.nn import DataParallel as DP
-from torch.utils.data import TensorDataset, DataLoader, Subset, Dataset
+from torch.utils.data import DataLoader, Subset
 from accelerate import Accelerator
 
 import optuna
@@ -38,11 +38,6 @@ from optuna.samplers import TPESampler
 
 import numpy as np
 import pandas as pd
-import scipy.stats
-import sklearn
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import matthews_corrcoef, precision_recall_fscore_support, confusion_matrix, classification_report
-from sklearn.utils.class_weight import compute_class_weight
 
 from data import TechDataset, CVSampler
 from models import Predictor
@@ -336,7 +331,6 @@ if __name__=="__main__":
         ## Load best model or train model
         final_model = build_model(configs.model, tokenizers=tech_dataset.tokenizers)
         if re.search("^1.", torch.__version__) is not None:
-#             model_size = sum(t.numel() for t in final_model.module.parameters())
             model_size = sum(t.numel() for t in final_model.parameters())
             print(f"Model size: {model_size/1000**2:.1f}M paramaters")
         else:

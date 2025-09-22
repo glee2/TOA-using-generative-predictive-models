@@ -9,3 +9,5 @@ results/*
 data/*
 !data/.keep
 backup/
+configs/best_hparam/*
+configs/USED_configs/*
