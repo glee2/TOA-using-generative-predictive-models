@@ -94,9 +94,6 @@ python src/main.py --config configs/configs.json --do_train
 python src/main.py --config configs/configs.json --do_tune
 ```
 
-![Training Process](figures/training_process.png)
-*Figure 4: Training process showing the joint training of VAE and MLP*
-
 ## Validation
 
 ### Technology opportunity exploration
